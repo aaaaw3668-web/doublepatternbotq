@@ -1,19 +1,29 @@
 import requests
+import websocket
+import json
 import time
-from datetime import datetime, date
 import threading
+from datetime import datetime, date
 import atexit
-import math
 
 # ==================== НАСТРОЙКИ ====================
 TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 
 # ========== НАСТРОЙКИ СКРИНЕРА ==========
-PUMP_THRESHOLD = 2.0               # Памп от 2% и выше
-RSI_OVERBOUGHT = 70                # RSI перекуплен от 70
-TIME_WINDOW = 60 * 5               # 5 минут для анализа
-RESISTANCE_LOOKBACK = 20           # 20 свечей для поиска сопротивления
-RESISTANCE_TOLERANCE = 0.002       # Допуск 0.2% от сопротивления
+PUMP_THRESHOLD = 2.0               # Памп от 2% за 5 минут
+TIME_WINDOW = 60 * 5               # 5 минут для анализа пампа
+
+# ========== НАСТРОЙКИ ЛИКВИДАЦИЙ (ПО ОБЪЁМУ) ==========
+# Минимальный объём ликвидаций шортов за минуту (в USDT)
+MIN_LIQUIDATION_VOLUME = {
+    'large': 500000,    # BTC/ETH: $500k+
+    'mid': 50000,       # Средние: $50k+
+    'small': 5000       # Мелкие: $5k+
+}
+
+# Альтернатива: процент от 24h объёма (включи если хочешь)
+USE_VOLUME_PERCENT = False          # False = используем фиксированные суммы
+LIQUIDATION_VOLUME_PERCENT = 0.5    # 0.5% от 24h объёма (если USE_VOLUME_PERCENT = True)
 
 # ========== НАСТРОЙКИ АДАПТИВНЫХ ЦЕЛЕЙ ==========
 MIN_TP = 0.6                       # Минимальный тейк (%)
@@ -43,10 +53,50 @@ users = {
     }
 }
 
-historical_data = {}
+historical_prices = {}
+liquidation_data = {}
+data_lock = threading.Lock()
+symbols_list = []
+websocket_connections = {}
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+def get_asset_category(symbol):
+    symbol_clean = symbol.replace('USDT', '').replace('1000', '')
+    
+    large_cap = ['BTC', 'ETH']
+    mid_cap = ['SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'AVAX', 'DOT', 'LINK', 'MATIC']
+    
+    if symbol_clean in large_cap:
+        return 'large'
+    elif symbol_clean in mid_cap:
+        return 'mid'
+    else:
+        return 'small'
+
+
+def get_liquidation_threshold_volume(symbol):
+    """Возвращает минимальный объём ликвидаций в USDT для актива"""
+    category = get_asset_category(symbol)
+    return MIN_LIQUIDATION_VOLUME.get(category, 5000)  # По умолчанию $5000
+
+
+def fetch_24h_volume(symbol):
+    """Получает 24h объём торгов в USDT для расчёта процента"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        params = {"symbol": symbol}
+        response = make_request_with_retry(url, params)
+        if response:
+            data = response.json()
+            # Объём в USDT (quoteVolume)
+            volume_usdt = float(data.get('quoteVolume', 0))
+            return volume_usdt
+    except Exception as e:
+        print(f"Ошибка получения объёма для {symbol}: {e}")
+    return 0
+
+
 def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
     for attempt in range(max_retries):
         try:
@@ -128,40 +178,8 @@ def send_telegram_notification(chat_id, message, symbol, exchange):
         return False
 
 
-# ==================== РАСЧЁТ RSI ====================
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
-        if change >= 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-# ==================== РАСЧЁТ ВОЛАТИЛЬНОСТИ ====================
+# ==================== РАСЧЁТ АДАПТИВНЫХ ЦЕЛЕЙ ====================
 def calculate_volatility(prices):
-    """Расчёт волатильности на основе ATR (Average True Range)"""
     if len(prices) < 10:
         return 1.0
     
@@ -180,92 +198,50 @@ def calculate_volatility(prices):
     return max(0.3, min(3.0, volatility_pct))
 
 
-def calculate_volume_profile(volumes):
-    """Анализ объёмов для оценки силы движения"""
-    if len(volumes) < 5:
-        return "normal"
-    
-    avg_volume = sum(volumes[-5:-1]) / 4
-    current_volume = volumes[-1]
-    
-    if current_volume > avg_volume * 2:
-        return "extremely_high"
-    elif current_volume > avg_volume * 1.5:
-        return "very_high"
-    elif current_volume > avg_volume * 1.2:
-        return "high"
-    elif current_volume < avg_volume * 0.5:
-        return "low"
-    else:
-        return "normal"
-
-
-# ==================== АДАПТИВНЫЕ ЦЕЛИ ====================
-def calculate_adaptive_targets(prices, volumes, pump_pct, rsi, resistance_level, current_price):
-    """
-    Расчёт адаптивных TP и SL на основе:
-    - Волатильности актива
-    - Силы пампа
-    - Уровня RSI
-    - Расстояния до сопротивления
-    - Объёмов
-    """
-    # 1. Базовая волатильность
+def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, current_price, symbol):
+    """Расчёт адаптивных TP и SL на основе объёма ликвидаций"""
     volatility = calculate_volatility(prices)
+    category = get_asset_category(symbol)
     
-    # 2. Коррекция на силу пампа (чем сильнее памп, тем глубже коррекция)
-    pump_factor = min(1.5, pump_pct / 2.0)  # Памп 4% → фактор 2.0
+    # Базовый фактор от волатильности
+    vol_factor = volatility / 1.0
     
-    # 3. Коррекция на RSI (чем выше RSI, тем сильнее разворот)
-    if rsi >= 85:
-        rsi_factor = 1.5
-    elif rsi >= 80:
-        rsi_factor = 1.2
-    elif rsi >= 75:
-        rsi_factor = 1.0
+    # Фактор от силы пампа
+    pump_factor = min(1.5, pump_pct / 2.0)
+    
+    # Фактор от объёма ликвидаций (чем больше объём, тем сильнее сигнал)
+    liq_threshold = get_liquidation_threshold_volume(symbol)
+    liq_factor = min(1.5, 1.0 + (liquidation_volume_usdt / liq_threshold) * 0.5)
+    
+    # Фактор от категории актива
+    if category == 'large':
+        category_factor = 0.7
+    elif category == 'mid':
+        category_factor = 1.0
     else:
-        rsi_factor = 0.8
+        category_factor = 1.3
     
-    # 4. Расстояние до сопротивления (чем ближе, тем точнее цель)
-    distance_to_resistance = (resistance_level - current_price) / resistance_level * 100
-    if distance_to_resistance < 0.1:
-        resistance_factor = 1.2  # Почти у сопротивления
-    elif distance_to_resistance < 0.3:
-        resistance_factor = 1.0
-    else:
-        resistance_factor = 0.7
-    
-    # 5. Анализ объёмов
-    volume_profile = calculate_volume_profile(volumes)
-    if volume_profile == "extremely_high":
-        volume_factor = 1.3
-    elif volume_profile == "very_high":
-        volume_factor = 1.1
-    elif volume_profile == "high":
-        volume_factor = 1.0
-    elif volume_profile == "low":
-        volume_factor = 0.6
-    else:
-        volume_factor = 0.8
-    
-    # 6. Расчёт итогового размера коррекции (глубина падения)
-    # TP1 (первая цель) — консервативная
-    tp1_base = 0.9 * pump_factor * rsi_factor * resistance_factor * volume_factor
+    # Расчёт TP1
+    tp1_base = 0.8 * pump_factor * liq_factor * category_factor
     tp1_pct = max(MIN_TP, min(MAX_TP * 0.8, tp1_base))
     
-    # TP2 (вторая цель) — более агрессивная
-    tp2_base = 1.3 * pump_factor * rsi_factor * resistance_factor * volume_factor
+    # Расчёт TP2
+    tp2_base = 1.2 * pump_factor * liq_factor * category_factor
     tp2_pct = max(tp1_pct + 0.3, min(MAX_TP, tp2_base))
     
-    # Стоп-лосс (выше сопротивления с учётом волатильности)
-    sl_base = 0.5 + volatility * 0.5
+    # Расчёт стоп-лосса
+    sl_base = 0.5 + volatility * 0.4
     sl_pct = max(MIN_SL, min(MAX_SL, sl_base))
     
-    # Расчёт вероятности успеха (математическое ожидание)
-    success_probability = calculate_success_probability(pump_pct, rsi, volume_profile)
+    # Расчёт вероятности успеха
+    success_prob = 50
+    success_prob += min(20, pump_pct * 5)
+    success_prob += min(25, (liquidation_volume_usdt / liq_threshold) * 15)
+    success_prob = min(90, success_prob)
     
-    # Математическое ожидание в % (риск 1% ради профита X%)
-    risk_reward_ratio = (tp1_pct + tp2_pct) / 2 / sl_pct
+    # Risk/Reward
+    avg_tp = (tp1_pct + tp2_pct) / 2
+    risk_reward = round(avg_tp / sl_pct, 2)
     
     return {
         'tp1_pct': round(tp1_pct, 2),
@@ -273,69 +249,93 @@ def calculate_adaptive_targets(prices, volumes, pump_pct, rsi, resistance_level,
         'sl_pct': round(sl_pct, 2),
         'tp1_price': current_price * (1 - tp1_pct / 100),
         'tp2_price': current_price * (1 - tp2_pct / 100),
-        'sl_price': resistance_level * (1 + sl_pct / 100),
-        'success_probability': success_probability,
-        'risk_reward': round(risk_reward_ratio, 2),
-        'volatility': round(volatility, 2),
-        'pump_factor': round(pump_factor, 2),
-        'rsi_factor': round(rsi_factor, 2)
+        'sl_price': current_price * (1 + sl_pct / 100),
+        'success_probability': success_prob,
+        'risk_reward': risk_reward,
+        'volatility': round(volatility, 2)
     }
 
 
-def calculate_success_probability(pump_pct, rsi, volume_profile):
-    """Расчёт вероятности успеха сигнала"""
-    prob = 50  # Базовая вероятность
-    
-    # Памп (чем больше, тем вероятнее коррекция)
-    if pump_pct >= 4:
-        prob += 15
-    elif pump_pct >= 3:
-        prob += 10
-    elif pump_pct >= 2:
-        prob += 5
-    
-    # RSI (чем выше, тем лучше)
-    if rsi >= 85:
-        prob += 15
-    elif rsi >= 80:
-        prob += 10
-    elif rsi >= 75:
-        prob += 5
-    
-    # Объёмы
-    if volume_profile == "extremely_high":
-        prob += 10
-    elif volume_profile == "very_high":
-        prob += 7
-    elif volume_profile == "high":
-        prob += 3
-    
-    return min(95, prob)
+# ==================== WEBSOCKET ДЛЯ ЛИКВИДАЦИЙ ====================
+def on_liquidation_message(ws, message, symbol):
+    try:
+        data = json.loads(message)
+        
+        if 'data' in data:
+            liquidations = data['data']
+            
+            with data_lock:
+                if symbol not in liquidation_data:
+                    liquidation_data[symbol] = []
+                
+                current_time = time.time()
+                
+                for liq in liquidations:
+                    side = liq.get('side', '')
+                    if 'Short' in side or side == 'Sell':
+                        size = float(liq.get('size', 0))
+                        price = float(liq.get('price', 0))
+                        volume_usdt = size * price  # Объём ликвидации в USDT
+                        
+                        liquidation_data[symbol].append({
+                            'time': current_time,
+                            'volume_usdt': volume_usdt,
+                            'price': price
+                        })
+                
+                # Очищаем старые ликвидации (старше 2 минут)
+                liquidation_data[symbol] = [
+                    l for l in liquidation_data[symbol]
+                    if current_time - l['time'] <= 120
+                ]
+                
+    except Exception as e:
+        print(f"Ошибка обработки ликвидаций для {symbol}: {e}")
 
 
-# ==================== ПОИСК СОПРОТИВЛЕНИЯ ====================
-def find_resistance(prices, lookback=RESISTANCE_LOOKBACK, tolerance=RESISTANCE_TOLERANCE):
-    if len(prices) < lookback:
-        return None, 0
-    
-    period_prices = prices[-lookback:-1]
-    if not period_prices:
-        return None, 0
-    
-    resistance_level = max(period_prices)
-    return resistance_level, resistance_level
+def on_liquidation_error(ws, error, symbol):
+    print(f"WebSocket ошибка для {symbol}: {error}")
 
 
-def is_near_resistance(current_price, resistance_level, tolerance=RESISTANCE_TOLERANCE):
-    if resistance_level is None or resistance_level == 0:
-        return False
-    
-    distance_pct = abs(current_price - resistance_level) / resistance_level
-    return distance_pct <= tolerance
+def on_liquidation_close(ws, close_status_code, close_msg, symbol):
+    print(f"WebSocket закрыт для {symbol}, переподключение...")
+    time.sleep(5)
+    connect_liquidation_websocket(symbol)
+
+
+def on_liquidation_open(ws, symbol):
+    print(f"WebSocket ликвидаций подключен для {symbol}")
+    subscribe_msg = {
+        "op": "subscribe",
+        "args": [f"liquidation.{symbol}"]
+    }
+    ws.send(json.dumps(subscribe_msg))
+
+
+def connect_liquidation_websocket(symbol):
+    try:
+        websocket_url = "wss://stream.bybit.com/v5/public/linear"
+        
+        ws = websocket.WebSocketApp(
+            websocket_url,
+            on_open=lambda ws: on_liquidation_open(ws, symbol),
+            on_message=lambda ws, msg: on_liquidation_message(ws, msg, symbol),
+            on_error=lambda ws, error: on_liquidation_error(ws, error, symbol),
+            on_close=lambda ws, code, msg: on_liquidation_close(ws, code, msg, symbol)
+        )
+        
+        wst = threading.Thread(target=ws.run_forever, daemon=True)
+        wst.start()
+        
+        websocket_connections[symbol] = ws
+        print(f"✅ WebSocket ликвидаций запущен для {symbol}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка WebSocket для {symbol}: {e}")
 
 
 # ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С БИРЖАМИ ====================
-def fetch_binance_klines(symbol, interval='5m', limit=30):
+def fetch_binance_klines(symbol, interval='5m', limit=10):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {'symbol': symbol, 'interval': interval, 'limit': limit}
@@ -344,28 +344,23 @@ def fetch_binance_klines(symbol, interval='5m', limit=30):
             data = response.json()
             if data and len(data) > 0:
                 prices = [float(candle[4]) for candle in data]
-                volumes = [float(candle[5]) for candle in data]
-                return prices, volumes
+                return prices
     except Exception as e:
         print(f"Ошибка Binance {symbol}: {e}")
-    return None, None
+    return None
 
 
-def fetch_bybit_klines(symbol, interval='5', limit=30):
+def fetch_binance_current_price(symbol):
     try:
-        url = "https://api.bybit.com/v5/market/kline"
-        params = {'category': 'linear', 'symbol': symbol, 'interval': interval, 'limit': limit}
+        url = "https://api.binance.com/api/v3/ticker/price"
+        params = {"symbol": symbol}
         response = make_request_with_retry(url, params)
         if response:
             data = response.json()
-            if data.get('retCode') == 0 and data.get('result', {}).get('list'):
-                klines = data['result']['list']
-                prices = [float(kline[3]) for kline in klines]
-                volumes = [float(kline[4]) for kline in klines]
-                return prices, volumes
+            return float(data['price'])
     except Exception as e:
-        print(f"Ошибка Bybit {symbol}: {e}")
-    return None, None
+        print(f"Ошибка Binance price {symbol}: {e}")
+    return None
 
 
 def fetch_binance_symbols():
@@ -385,169 +380,142 @@ def fetch_binance_symbols():
     return []
 
 
-def fetch_bybit_symbols():
-    try:
-        url = "https://api.bybit.com/v5/market/instruments-info"
-        params = {"category": "linear"}
-        response = make_request_with_retry(url, params)
-        if response:
-            data = response.json()
-            if data.get('retCode') == 0:
-                symbols = [item['symbol'] for item in data['result']['list']]
-                print(f"Bybit: получено {len(symbols)} символов")
-                return symbols
-    except Exception as e:
-        print(f"Ошибка Bybit symbols: {e}")
-    return []
-
-
-def fetch_binance_current_price(symbol):
-    try:
-        url = "https://api.binance.com/api/v3/ticker/price"
-        params = {"symbol": symbol}
-        response = make_request_with_retry(url, params)
-        if response:
-            data = response.json()
-            return float(data['price'])
-    except Exception as e:
-        print(f"Ошибка Binance price {symbol}: {e}")
-    return None
-
-
-def fetch_bybit_current_price(symbol):
-    try:
-        url = "https://api.bybit.com/v5/market/tickers"
-        params = {"category": "linear", "symbol": symbol}
-        response = make_request_with_retry(url, params)
-        if response:
-            data = response.json()
-            if data.get('retCode') == 0 and data.get('result', {}).get('list'):
-                return float(data['result']['list'][0]['lastPrice'])
-    except Exception as e:
-        print(f"Ошибка Bybit price {symbol}: {e}")
-    return None
-
-
 # ==================== ОСНОВНАЯ ЛОГИКА ====================
-def check_signal(prices, volumes, current_price):
-    if len(prices) < RESISTANCE_LOOKBACK + 2:
+def check_pump_and_liquidations(symbol, current_price):
+    try:
+        # Получаем историю цен
+        prices = fetch_binance_klines(symbol, limit=6)
+        if prices is None or len(prices) < 2:
+            return False, None
+        
+        # Проверяем памп
+        price_5min_ago = prices[-2] if len(prices) >= 2 else prices[0]
+        pump_pct = ((current_price - price_5min_ago) / price_5min_ago) * 100
+        
+        if pump_pct < PUMP_THRESHOLD:
+            return False, None
+        
+        # Получаем общий объём ликвидаций шортов за последнюю минуту
+        with data_lock:
+            total_volume_usdt = 0
+            current_time = time.time()
+            
+            if symbol in liquidation_data:
+                for liq in liquidation_data[symbol]:
+                    if current_time - liq['time'] <= 60:
+                        total_volume_usdt += liq['volume_usdt']
+        
+        # Проверяем порог по объёму
+        liq_threshold = get_liquidation_threshold_volume(symbol)
+        
+        if total_volume_usdt < liq_threshold:
+            return False, None
+        
+        # Рассчитываем адаптивные цели
+        targets = calculate_adaptive_targets(prices, pump_pct, total_volume_usdt, current_price, symbol)
+        
+        # Определяем силу сигнала
+        volume_ratio = total_volume_usdt / liq_threshold
+        if volume_ratio >= 5:
+            strength_emoji = "🔴🔴🔴"
+            strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
+        elif volume_ratio >= 3:
+            strength_emoji = "🔴🔴"
+            strength_text = "ОЧЕНЬ СИЛЬНЫЙ"
+        elif volume_ratio >= 1.5:
+            strength_emoji = "🔴"
+            strength_text = "СИЛЬНЫЙ"
+        else:
+            strength_emoji = "🟠"
+            strength_text = "СРЕДНИЙ"
+        
+        details = {
+            'pump_pct': pump_pct,
+            'total_volume_usdt': total_volume_usdt,
+            'liq_threshold': liq_threshold,
+            'current_price': current_price,
+            'strength_emoji': strength_emoji,
+            'strength_text': strength_text,
+            'targets': targets,
+            'category': get_asset_category(symbol)
+        }
+        
+        return True, details
+        
+    except Exception as e:
+        print(f"Ошибка проверки {symbol}: {e}")
         return False, None
-    
-    # 1. Проверка пампа
-    price_start = prices[0]
-    price_end = prices[-1]
-    
-    if price_start == 0:
-        return False, None
-    
-    pump_pct = ((price_end - price_start) / price_start) * 100
-    
-    if pump_pct < PUMP_THRESHOLD:
-        return False, None
-    
-    # 2. Поиск сопротивления
-    resistance_level, _ = find_resistance(prices)
-    
-    if resistance_level is None:
-        return False, None
-    
-    # 3. Проверка возле сопротивления
-    near_resistance = is_near_resistance(current_price, resistance_level)
-    
-    if not near_resistance:
-        return False, None
-    
-    # 4. Расчёт RSI
-    rsi = calculate_rsi(prices)
-    
-    if rsi is None or rsi < RSI_OVERBOUGHT:
-        return False, None
-    
-    # 5. Расчёт адаптивных целей
-    targets = calculate_adaptive_targets(prices, volumes, pump_pct, rsi, resistance_level, current_price)
-    
-    # Определяем силу сигнала
-    if rsi >= 85:
-        strength_emoji = "🔴🔴🔴"
-        strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
-    elif rsi >= 80:
-        strength_emoji = "🔴🔴"
-        strength_text = "ОЧЕНЬ СИЛЬНЫЙ"
-    else:
-        strength_emoji = "🔴"
-        strength_text = "СИЛЬНЫЙ"
-    
-    details = {
-        'pump_pct': pump_pct,
-        'resistance': resistance_level,
-        'rsi': rsi,
-        'current_price': current_price,
-        'strength_emoji': strength_emoji,
-        'strength_text': strength_text,
-        'distance_to_resistance': ((resistance_level - current_price) / resistance_level) * 100,
-        'targets': targets
-    }
-    
-    return True, details
 
 
-# ==================== МОНИТОРИНГ ====================
-def monitor_signal(exchange_name, fetch_symbols_func, fetch_klines_func, fetch_price_func):
-    print(f"🚀 Запуск адаптивного скринера на {exchange_name}...")
-
-    symbols = fetch_symbols_func()
-    if not symbols:
-        print(f"{exchange_name}: не удалось получить символы")
-        time.sleep(30)
+def monitor_pumps():
+    global symbols_list
+    
+    print("🚀 Запуск мониторинга памп + ликвидации (по объёму)...")
+    
+    symbols_list = fetch_binance_symbols()
+    if not symbols_list:
+        print("Не удалось получить символы")
         return
-
-    print(f"{exchange_name}: мониторинг {len(symbols)} символов")
-
+    
+    # Запускаем WebSocket для каждого символа
+    print(f"Запуск WebSocket для {len(symbols_list)} символов...")
+    for symbol in symbols_list:
+        connect_liquidation_websocket(symbol)
+        time.sleep(0.1)
+    
+    print(f"Мониторинг {len(symbols_list)} символов")
+    print(f"Пороги ликвидаций: BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}, "
+          f"Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}, "
+          f"Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}")
+    
     last_alert_time = {}
     error_count = 0
-    max_errors_before_reload = 20
-
+    
     while True:
         try:
-            successful_scans = 0
-            
-            for symbol in symbols:
+            for symbol in symbols_list:
                 try:
                     current_time_check = time.time()
                     if symbol in last_alert_time and current_time_check - last_alert_time[symbol] < MIN_TIME_BETWEEN_SIGNALS:
                         continue
                     
-                    current_price = fetch_price_func(symbol)
+                    current_price = fetch_binance_current_price(symbol)
                     if current_price is None or current_price < MIN_PRICE:
                         continue
                     
-                    prices, volumes = fetch_klines_func(symbol, limit=30)
-                    if prices is None or len(prices) < 15:
-                        continue
-                    
-                    successful_scans += 1
-                    error_count = 0
-                    
-                    is_signal, details = check_signal(prices, volumes, current_price)
+                    is_signal, details = check_pump_and_liquidations(symbol, current_price)
                     
                     if is_signal and details:
                         last_alert_time[symbol] = current_time_check
                         t = details['targets']
                         
-                        # Создаём визуализацию вероятности
+                        # Категория актива
+                        if details['category'] == 'large':
+                            cat_emoji = "🐋"
+                            cat_text = "Крупная капа"
+                        elif details['category'] == 'mid':
+                            cat_emoji = "📊"
+                            cat_text = "Средняя капа"
+                        else:
+                            cat_emoji = "🔥"
+                            cat_text = "Мелкая капа"
+                        
                         prob_bar = "█" * (t['success_probability'] // 10) + "░" * (10 - t['success_probability'] // 10)
                         
+                        # Форматируем объём ликвидаций
+                        liq_volume_formatted = f"${details['total_volume_usdt']:,.0f}"
+                        liq_threshold_formatted = f"${details['liq_threshold']:,.0f}"
+                        
                         msg = (
-                            f"{details['strength_emoji']} <b>ПАМП У СОПРОТИВЛЕНИЯ</b> {details['strength_emoji']}\n\n"
-                            f"Монета: <code>{symbol}</code> ({exchange_name})\n"
+                            f"{details['strength_emoji']} <b>ПАМП + ЛИКВИДАЦИИ ШОРТОВ</b> {details['strength_emoji']}\n\n"
+                            f"Монета: <code>{symbol}</code> (Binance)\n"
+                            f"{cat_emoji} Категория: {cat_text}\n"
                             f"💰 Цена: {current_price:.8f}\n\n"
                             f"📊 <b>Сигнал:</b>\n"
                             f"• Памп за 5 мин: +{details['pump_pct']:.2f}%\n"
-                            f"• RSI: {details['rsi']:.1f} (перекуплен)\n"
-                            f"• Сопротивление: {details['resistance']:.8f}\n"
-                            f"• До сопротивления: {details['distance_to_resistance']:.2f}%\n"
+                            f"• Ликвидации шортов: {liq_volume_formatted} (порог: {liq_threshold_formatted})\n"
                             f"• Качество: {details['strength_text']}\n\n"
-                            f"📈 <b>Адаптивные цели (на основе волатильности):</b>\n"
+                            f"📈 <b>Адаптивные цели:</b>\n"
                             f"• Волатильность: {t['volatility']}%\n"
                             f"• Вероятность успеха: {t['success_probability']}% {prob_bar}\n"
                             f"• Risk/Reward: 1:{t['risk_reward']}\n\n"
@@ -555,36 +523,25 @@ def monitor_signal(exchange_name, fetch_symbols_func, fetch_klines_func, fetch_p
                             f"• TP1 ({t['tp1_pct']}%): {t['tp1_price']:.8f}\n"
                             f"• TP2 ({t['tp2_pct']}%): {t['tp2_price']:.8f}\n\n"
                             f"⛔ <b>Стоп-лосс:</b>\n"
-                            f"• SL ({t['sl_pct']}%): {t['sl_price']:.8f} (выше сопротивления)\n\n"
-                            f"💡 <b>Математическое ожидание:</b>\n"
-                            f"Риск {t['sl_pct']}% ради профита {t['tp1_pct']}-{t['tp2_pct']}%\n"
-                            f"Ожидаемая доходность: +{t['risk_reward'] * 0.7:.2f}R"
+                            f"• SL ({t['sl_pct']}%): {t['sl_price']:.8f}\n\n"
+                            f"💡 <b>Логика:</b>\n"
+                            f"Цена выросла на {details['pump_pct']:.1f}%, выбив шортов на {liq_volume_formatted}.\n"
+                            f"Умные деньги забрали ликвидность — готовьте шорт!"
                         )
                         
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
-                                send_telegram_notification(chat_id, msg, symbol, exchange_name)
+                                send_telegram_notification(chat_id, msg, symbol, "Binance")
                     
                 except Exception as e:
-                    print(f"{exchange_name} ошибка {symbol}: {e}")
+                    print(f"Ошибка {symbol}: {e}")
                     error_count += 1
                     continue
-            
-            if successful_scans > 0:
-                scan_rate = (successful_scans / len(symbols)) * 100 if symbols else 0
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {exchange_name}: {successful_scans}/{len(symbols)} ({scan_rate:.1f}%)")
-            
-            if error_count >= max_errors_before_reload:
-                print(f"{exchange_name}: перезагружаем символы...")
-                new_symbols = fetch_symbols_func()
-                if new_symbols:
-                    symbols = new_symbols
-                error_count = 0
             
             time.sleep(SCAN_INTERVAL)
             
         except Exception as e:
-            print(f"{exchange_name} критическая ошибка: {e}")
+            print(f"Критическая ошибка: {e}")
             time.sleep(10)
 
 
@@ -624,7 +581,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': f"✅ Вы подписались на АДАПТИВНЫЙ скринер!\n\n📊 <b>Что нового:</b>\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL рассчитываются под каждый актив\n• Учитывают волатильность, силу пампа, RSI\n• Разные цели для разных монет\n\n📈 <b>Математическое ожидание</b>\n• Вероятность успеха сигнала\n• Risk/Reward ratio\n• Ожидаемая доходность\n\n📍 Биржи: Binance + Bybit\n⏱️ Таймфрейм: 5 минут",
+                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние монеты: от $50,000\n• Мелкие монеты: от $5,000\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n• Учитывают объём ликвидаций\n\n📍 Биржа: Binance\n🔗 WebSocket реального времени",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -638,7 +595,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Адаптивный скринер</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Как рассчитываются цели:</b>\n• Волатильность актива\n• Сила пампа (чем сильнее, тем глубже коррекция)\n• Уровень RSI\n• Анализ объёмов\n\n🎯 Тейк: от 0.6% до 2.5%\n⛔ Стоп: от 0.4% до 1.2%",
+                            'text': "🤖 <b>Памп + Ликвидации шортов</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Логика:</b>\n1. Памп от 2% за 5 минут\n2. Ликвидации шортов на значительную сумму\n3. → Шорт\n\n📍 Биржа: Binance",
                             'parse_mode': 'HTML'
                         }
                         requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -650,7 +607,7 @@ def handle_telegram_updates():
 
 
 def send_shutdown_message():
-    shutdown_msg = "🛑 <b>Адаптивный скринер остановлен</b>"
+    shutdown_msg = "🛑 <b>Скринер «Памп + Ликвидации» остановлен</b>"
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
             try:
@@ -664,9 +621,12 @@ def send_shutdown_message():
 # ==================== MAIN ====================
 def main():
     print("=" * 60)
-    print("АДАПТИВНЫЙ СКРИНЕР «ПАМП У СОПРОТИВЛЕНИЯ»")
-    print("TP/SL рассчитываются под каждый актив")
-    print("Биржи: Binance + Bybit")
+    print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ ШОРТОВ»")
+    print(f"Памп: от {PUMP_THRESHOLD}% за 5 минут")
+    print("Ликвидации: по ОБЪЁМУ в USDT")
+    print(f"Пороги: крупные ${MIN_LIQUIDATION_VOLUME['large']:,}, "
+          f"средние ${MIN_LIQUIDATION_VOLUME['mid']:,}, "
+          f"мелкие ${MIN_LIQUIDATION_VOLUME['small']:,}")
     print("=" * 60)
 
     atexit.register(send_shutdown_message)
@@ -677,16 +637,17 @@ def main():
     time.sleep(2)
 
     startup_msg = (
-        f"🔍 <b>Адаптивный скринер запущен!</b>\n\n"
+        f"🔍 <b>Скринер «Памп + Ликвидации» запущен!</b>\n\n"
         f"📊 <b>Условия для шорта:</b>\n"
         f"• Памп от {PUMP_THRESHOLD}% за 5 минут\n"
-        f"• Цена возле сопротивления\n"
-        f"• RSI выше {RSI_OVERBOUGHT}\n\n"
+        f"• Ликвидации шортов на сумму от:\n"
+        f"  - BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}\n"
+        f"  - Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}\n"
+        f"  - Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}\n\n"
         f"🎯 <b>Адаптивные цели:</b>\n"
-        f"• TP рассчитывается под волатильность\n"
-        f"• Учитывается сила пампа и RSI\n"
-        f"• Разные цели для разных активов\n\n"
-        f"📍 Биржи: Binance + Bybit"
+        f"• TP: от {MIN_TP}% до {MAX_TP}%\n"
+        f"• SL: от {MIN_SL}% до {MAX_SL}%\n\n"
+        f"📍 Биржа: Binance"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
@@ -697,26 +658,7 @@ def main():
             except Exception:
                 pass
 
-    binance_thread = threading.Thread(
-        target=monitor_signal,
-        args=("Binance", fetch_binance_symbols, fetch_binance_klines, fetch_binance_current_price),
-        daemon=True
-    )
-
-    bybit_thread = threading.Thread(
-        target=monitor_signal,
-        args=("Bybit", fetch_bybit_symbols, fetch_bybit_klines, fetch_bybit_current_price),
-        daemon=True
-    )
-
-    binance_thread.start()
-    bybit_thread.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Остановка бота...")
+    monitor_pumps()
 
 
 if __name__ == "__main__":
