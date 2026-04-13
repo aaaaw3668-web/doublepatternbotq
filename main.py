@@ -11,14 +11,21 @@ TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
 RSI_PERIOD = 14
 RSI_OVERBOUGHT_THRESHOLD = 75       # Порог перекупленности (75+)
 RSI_EXTREME_THRESHOLD = 85          # Экстремальная перекупленность (85+)
-TIME_WINDOW = 60 * 3                # 3 минуты данных
+RSI_TIME_WINDOW = 60 * 3            # 3 минуты данных
 
-# Дополнительные фильтры
-MIN_PRICE = 0.01                    # Минимальная цена монеты
-MAX_ALERTS_PER_DAY = 10             # Максимум сигналов на монету в день
-SCAN_INTERVAL = 3                   # Проверка каждые 3 секунды
+# ========== НАСТРОЙКИ TEMA + MACD ==========
+TEMA_PERIOD = 9                     # Период TEMA
+MACD_FAST = 12                      # Быстрая EMA
+MACD_SLOW = 26                      # Медленная EMA
+MACD_SIGNAL = 9                     # Сигнальная линия
+TEMA_MACD_TIME_WINDOW = 60 * 5      # 5 минут данных для анализа
 
-# Защита от частых сигналов (не чаще 1 раза в 5 минут)
+# ========== ОБЩИЕ НАСТРОЙКИ ==========
+MIN_PRICE = 0.01
+MAX_ALERTS_PER_DAY = 10
+SCAN_INTERVAL = 3
+
+# Защита от частых сигналов
 MIN_TIME_BETWEEN_SIGNALS = 300      # 5 минут
 
 # Настройки запросов
@@ -38,7 +45,8 @@ users = {
 }
 
 # Глобальные структуры
-historical_data = {}
+historical_data_rsi = {}
+historical_data_tema = {}
 
 
 def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
@@ -79,20 +87,21 @@ def reset_daily_counters(chat_id):
         users[chat_id]['daily_alerts']['counts'] = {}
 
 
-def can_send_alert(chat_id, symbol):
+def can_send_alert(chat_id, symbol, indicator):
     if chat_id not in users or not users[chat_id]['active']:
         return False
 
     reset_daily_counters(chat_id)
-    count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
+    key = f"{symbol}_{indicator}"
+    count = users[chat_id]['daily_alerts']['counts'].get(key, 0)
     if count >= MAX_ALERTS_PER_DAY:
         return False
-    users[chat_id]['daily_alerts']['counts'][symbol] = count + 1
+    users[chat_id]['daily_alerts']['counts'][key] = count + 1
     return True
 
 
-def send_telegram_notification(chat_id, message, symbol, exchange):
-    if not can_send_alert(chat_id, symbol):
+def send_telegram_notification(chat_id, message, symbol, exchange, indicator):
+    if not can_send_alert(chat_id, symbol, indicator):
         return False
 
     monospace_symbol = f"<code>{symbol}</code>"
@@ -122,8 +131,8 @@ def send_telegram_notification(chat_id, message, symbol, exchange):
         return False
 
 
+# ==================== RSI ФУНКЦИИ ====================
 def calculate_rsi(prices):
-    """Расчёт RSI"""
     if len(prices) < RSI_PERIOD + 1:
         return None
 
@@ -154,28 +163,16 @@ def calculate_rsi(prices):
 
 
 def check_rsi_signal(price_values, current_price):
-    """
-    ПРОСТАЯ ЛОГИКА:
-    - RSI перекуплен (>=75)
-    - ВСЁ! Сигнал на шорт
-    """
     if len(price_values) < RSI_PERIOD + 1:
         return False, None, None
     
-    # Проверка минимальной цены
     if current_price < MIN_PRICE:
         return False, None, None
     
-    # Расчёт RSI
     rsi = calculate_rsi(price_values)
-    if rsi is None:
+    if rsi is None or rsi < RSI_OVERBOUGHT_THRESHOLD:
         return False, None, None
     
-    # Простая проверка: RSI перекуплен?
-    if rsi < RSI_OVERBOUGHT_THRESHOLD:
-        return False, None, None
-    
-    # Определяем силу сигнала
     if rsi >= RSI_EXTREME_THRESHOLD:
         strength_emoji = "🔴🔴🔴"
         strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
@@ -189,8 +186,189 @@ def check_rsi_signal(price_values, current_price):
     return True, rsi, {'strength_emoji': strength_emoji, 'strength_text': strength_text}
 
 
+# ==================== TEMA + MACD ФУНКЦИИ ====================
+def calculate_ema(prices, period):
+    """Расчёт EMA"""
+    if len(prices) < period:
+        return None
+    
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    
+    for price in prices[1:]:
+        ema = (price - ema) * multiplier + ema
+    
+    return ema
+
+
+def calculate_ema_series(prices, period):
+    """Расчёт серии EMA для всех цен"""
+    if len(prices) < period:
+        return None
+    
+    multiplier = 2 / (period + 1)
+    ema_values = [prices[0]]
+    
+    for price in prices[1:]:
+        ema = (price - ema_values[-1]) * multiplier + ema_values[-1]
+        ema_values.append(ema)
+    
+    return ema_values
+
+
+def calculate_tema(prices, period=TEMA_PERIOD):
+    """Triple Exponential Moving Average"""
+    if len(prices) < period * 3:
+        return None
+    
+    # EMA1
+    ema1 = calculate_ema_series(prices, period)
+    if ema1 is None:
+        return None
+    
+    # EMA2 (от EMA1)
+    ema2 = calculate_ema_series(ema1, period)
+    if ema2 is None:
+        return None
+    
+    # EMA3 (от EMA2)
+    ema3 = calculate_ema_series(ema2, period)
+    if ema3 is None:
+        return None
+    
+    # TEMA = 3*EMA1 - 3*EMA2 + EMA3
+    tema = [3*ema1[i] - 3*ema2[i] + ema3[i] for i in range(len(prices))]
+    
+    return tema
+
+
+def calculate_macd(prices):
+    """Расчёт MACD и сигнальной линии"""
+    if len(prices) < MACD_SLOW + MACD_SIGNAL:
+        return None, None, None
+    
+    # Быстрая EMA (12)
+    fast_ema = calculate_ema_series(prices, MACD_FAST)
+    # Медленная EMA (26)
+    slow_ema = calculate_ema_series(prices, MACD_SLOW)
+    
+    if fast_ema is None or slow_ema is None:
+        return None, None, None
+    
+    # MACD линия = Fast - Slow
+    macd_line = [fast_ema[i] - slow_ema[i] for i in range(len(prices))]
+    
+    # Сигнальная линия (EMA от MACD, период 9)
+    signal_line = calculate_ema_series(macd_line, MACD_SIGNAL)
+    
+    if signal_line is None:
+        return None, None, None
+    
+    # Гистограмма
+    histogram = [macd_line[i] - signal_line[i] for i in range(len(prices))]
+    
+    return macd_line, signal_line, histogram
+
+
+def check_tema_macd_signal(prices, current_price):
+    """
+    Сигнал для шорта:
+    - Цена ниже TEMA (медвежий тренд)
+    - MACD пересекает сигнальную линию сверху вниз
+    """
+    if len(prices) < 50:
+        return False, None
+    
+    if current_price < MIN_PRICE:
+        return False, None
+    
+    # Рассчитываем TEMA
+    tema_values = calculate_tema(prices)
+    if tema_values is None or len(tema_values) < 10:
+        return False, None
+    
+    # Рассчитываем MACD
+    macd_line, signal_line, histogram = calculate_macd(prices)
+    if macd_line is None or signal_line is None:
+        return False, None
+    
+    current_tema = tema_values[-1]
+    current_macd = macd_line[-1]
+    current_signal = signal_line[-1]
+    current_histogram = histogram[-1]
+    prev_histogram = histogram[-2] if len(histogram) > 1 else 0
+    
+    # Условия для шорта:
+    # 1. Цена ниже TEMA
+    price_below_tema = current_price < current_tema
+    
+    # 2. MACD пересекает сигнал сверху вниз (медвежий крест)
+    macd_cross_bearish = (macd_line[-2] > signal_line[-2] and 
+                          current_macd < current_signal)
+    
+    # 3. Гистограмма отрицательная
+    histogram_negative = current_histogram < 0
+    
+    if price_below_tema and macd_cross_bearish and histogram_negative:
+        # Оценка силы сигнала
+        if current_histogram < prev_histogram * 1.2:
+            strength_emoji = "🔴🔴"
+            strength_text = "СИЛЬНЫЙ"
+        else:
+            strength_emoji = "🟠"
+            strength_text = "СРЕДНИЙ"
+        
+        details = {
+            'current_price': current_price,
+            'current_tema': current_tema,
+            'macd': current_macd,
+            'signal': current_signal,
+            'histogram': current_histogram,
+            'price_vs_tema': ((current_price - current_tema) / current_tema) * 100,
+            'strength_emoji': strength_emoji,
+            'strength_text': strength_text
+        }
+        
+        return True, details
+    
+    return False, None
+
+
+# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С БИРЖАМИ ====================
+def fetch_binance_klines(symbol, interval='1m', limit=60):
+    """Получение свечей с Binance"""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+        response = make_request_with_retry(url, params)
+        if response:
+            data = response.json()
+            if data and len(data) > 0:
+                prices = [float(candle[4]) for candle in data]
+                return prices
+    except Exception as e:
+        print(f"Ошибка Binance {symbol}: {e}")
+    return None
+
+
+def fetch_bybit_klines(symbol, interval='1', limit=60):
+    """Получение свечей с Bybit"""
+    try:
+        url = "https://api.bybit.com/v5/market/kline"
+        params = {'category': 'linear', 'symbol': symbol, 'interval': interval, 'limit': limit}
+        response = make_request_with_retry(url, params)
+        if response:
+            data = response.json()
+            if data.get('retCode') == 0 and data.get('result', {}).get('list'):
+                klines = data['result']['list']
+                prices = [float(kline[3]) for kline in klines]
+                return prices
+    except Exception as e:
+        print(f"Ошибка Bybit {symbol}: {e}")
+    return None
+
+
 def fetch_binance_symbols():
-    """Получение списка символов с Binance"""
     try:
         url = "https://api.binance.com/api/v3/exchangeInfo"
         response = make_request_with_retry(url, timeout=15)
@@ -208,7 +386,6 @@ def fetch_binance_symbols():
 
 
 def fetch_bybit_symbols():
-    """Получение списка символов с Bybit"""
     try:
         url = "https://api.bybit.com/v5/market/instruments-info"
         params = {"category": "linear"}
@@ -225,7 +402,6 @@ def fetch_bybit_symbols():
 
 
 def fetch_binance_ticker(symbol):
-    """Получение цены с Binance"""
     try:
         url = "https://api.binance.com/api/v3/ticker/price"
         params = {"symbol": symbol}
@@ -239,7 +415,6 @@ def fetch_binance_ticker(symbol):
 
 
 def fetch_bybit_ticker(symbol):
-    """Получение цены с Bybit"""
     try:
         url = "https://api.bybit.com/v5/market/tickers"
         params = {"category": "linear", "symbol": symbol}
@@ -253,118 +428,152 @@ def fetch_bybit_ticker(symbol):
     return None
 
 
-def monitor_exchange(exchange_name, fetch_symbols_func, fetch_ticker_func):
-    """Мониторинг RSI перекупленности"""
-    print(f"🚀 Запуск RSI мониторинга на {exchange_name}...")
-    print(f"📊 Логика: RSI >= {RSI_OVERBOUGHT_THRESHOLD} → ШОРТ")
+# ==================== RSI МОНИТОРИНГ ====================
+def monitor_rsi(exchange_name, fetch_symbols_func, fetch_ticker_func):
+    print(f"🚀 Запуск RSI на {exchange_name}...")
 
     symbols = fetch_symbols_func()
     if not symbols:
-        print(f"{exchange_name}: не удалось получить символы")
-        time.sleep(30)
+        print(f"{exchange_name} RSI: нет символов")
         return
 
-    # Инициализация
     for symbol in symbols:
         key = f"{exchange_name}_{symbol}"
-        if key not in historical_data:
-            historical_data[key] = {'price': []}
+        if key not in historical_data_rsi:
+            historical_data_rsi[key] = {'price': []}
 
-    print(f"{exchange_name}: мониторинг {len(symbols)} символов")
+    print(f"{exchange_name} RSI: мониторинг {len(symbols)} символов")
 
-    error_count = 0
-    max_errors_before_reload = 10
     last_alert_time = {}
 
     while True:
         try:
-            successful_requests = 0
-            
             for symbol in symbols:
                 try:
                     current_price = fetch_ticker_func(symbol)
                     if current_price is None:
-                        error_count += 1
                         continue
-                    
-                    successful_requests += 1
-                    error_count = 0
                     
                     timestamp = int(datetime.now().timestamp())
                     key = f"{exchange_name}_{symbol}"
                     
-                    # Обновляем историю цен
-                    historical_data[key]['price'].append({'value': current_price, 'timestamp': timestamp})
-                    historical_data[key]['price'] = [
-                        x for x in historical_data[key]['price']
-                        if timestamp - x['timestamp'] <= TIME_WINDOW
+                    historical_data_rsi[key]['price'].append({'value': current_price, 'timestamp': timestamp})
+                    historical_data_rsi[key]['price'] = [
+                        x for x in historical_data_rsi[key]['price']
+                        if timestamp - x['timestamp'] <= RSI_TIME_WINDOW
                     ]
                     
-                    # Получаем цены по порядку
-                    price_entries = sorted(historical_data[key]['price'], key=lambda x: x['timestamp'])
+                    price_entries = sorted(historical_data_rsi[key]['price'], key=lambda x: x['timestamp'])
                     price_values = [entry['value'] for entry in price_entries]
                     
-                    # Проверяем сигнал
                     is_signal, rsi, strength = check_rsi_signal(price_values, current_price)
                     
                     if is_signal and rsi is not None:
-                        # Защита от частых сигналов
                         last_time = last_alert_time.get(symbol, 0)
                         if time.time() - last_time < MIN_TIME_BETWEEN_SIGNALS:
                             continue
                         
                         last_alert_time[symbol] = time.time()
                         
-                        # Рассчитываем цели
-                        target1 = current_price * 0.991  # -0.9%
-                        target2 = current_price * 0.985  # -1.5%
-                        stop_loss = current_price * 1.005  # +0.5%
+                        target1 = current_price * 0.991
+                        target2 = current_price * 0.985
+                        stop_loss = current_price * 1.005
                         
                         msg = (
                             f"{strength['strength_emoji']} <b>RSI ПЕРЕКУПЛЕННОСТЬ</b> {strength['strength_emoji']}\n\n"
                             f"Монета: <code>{symbol}</code> ({exchange_name})\n"
-                            f"💰 Текущая цена: {current_price:.8f}\n\n"
-                            f"📊 <b>Детали:</b>\n"
-                            f"• RSI: {rsi:.1f}\n"
-                            f"• Порог: {RSI_OVERBOUGHT_THRESHOLD}\n"
-                            f"• Качество: {strength['strength_text']}\n\n"
-                            f"🎯 <b>Цели для шорта:</b>\n"
-                            f"• TP1 (-0.9%): {target1:.8f}\n"
-                            f"• TP2 (-1.5%): {target2:.8f}\n\n"
-                            f"⛔ Стоп-лосс (+0.5%): {stop_loss:.8f}\n\n"
-                            f"💡 <i>RSI перекуплен → ожидайте коррекцию вниз</i>"
+                            f"💰 Цена: {current_price:.8f}\n\n"
+                            f"📊 RSI: {rsi:.1f} | {strength['strength_text']}\n\n"
+                            f"🎯 TP1 (-0.9%): {target1:.8f}\n"
+                            f"🎯 TP2 (-1.5%): {target2:.8f}\n"
+                            f"⛔ Стоп: {stop_loss:.8f}"
                         )
                         
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
-                                send_telegram_notification(chat_id, msg, symbol, exchange_name)
+                                send_telegram_notification(chat_id, msg, symbol, exchange_name, "RSI")
                     
                 except Exception as e:
-                    print(f"{exchange_name} ошибка {symbol}: {e}")
-                    error_count += 1
+                    print(f"{exchange_name} RSI ошибка {symbol}: {e}")
                     continue
-            
-            # Логирование
-            success_rate = (successful_requests / len(symbols)) * 100 if symbols else 0
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {exchange_name}: {successful_requests}/{len(symbols)} ({success_rate:.1f}%)")
-            
-            # Перезагрузка при ошибках
-            if error_count >= max_errors_before_reload:
-                print(f"{exchange_name}: перезагружаем символы...")
-                new_symbols = fetch_symbols_func()
-                if new_symbols:
-                    symbols = new_symbols
-                error_count = 0
-            
+
             time.sleep(SCAN_INTERVAL)
-            
+
         except Exception as e:
-            print(f"{exchange_name} критическая ошибка: {e}")
+            print(f"{exchange_name} RSI ошибка: {e}")
             time.sleep(10)
 
 
+# ==================== TEMA+MACD МОНИТОРИНГ ====================
+def monitor_tema_macd(exchange_name, fetch_symbols_func, fetch_klines_func, fetch_ticker_func):
+    print(f"🚀 Запуск TEMA+MACD на {exchange_name}...")
+
+    symbols = fetch_symbols_func()
+    if not symbols:
+        print(f"{exchange_name} TEMA+MACD: нет символов")
+        return
+
+    print(f"{exchange_name} TEMA+MACD: мониторинг {len(symbols)} символов")
+
+    last_alert_time = {}
+
+    while True:
+        try:
+            for symbol in symbols:
+                try:
+                    current_price = fetch_ticker_func(symbol)
+                    if current_price is None:
+                        continue
+                    
+                    prices = fetch_klines_func(symbol, limit=60)
+                    if prices is None or len(prices) < 50:
+                        continue
+                    
+                    is_signal, details = check_tema_macd_signal(prices, current_price)
+                    
+                    if is_signal and details:
+                        last_time = last_alert_time.get(symbol, 0)
+                        if time.time() - last_time < MIN_TIME_BETWEEN_SIGNALS:
+                            continue
+                        
+                        last_alert_time[symbol] = time.time()
+                        
+                        target1 = current_price * 0.991
+                        target2 = current_price * 0.985
+                        stop_loss = current_price * 1.005
+                        
+                        msg = (
+                            f"{details['strength_emoji']} <b>TEMA + MACD МЕДВЕЖИЙ КРОСС</b> {details['strength_emoji']}\n\n"
+                            f"Монета: <code>{symbol}</code> ({exchange_name})\n"
+                            f"💰 Цена: {current_price:.8f}\n\n"
+                            f"📊 <b>Детали:</b>\n"
+                            f"• TEMA: {details['current_tema']:.8f}\n"
+                            f"• Цена vs TEMA: {details['price_vs_tema']:.2f}%\n"
+                            f"• MACD: {details['macd']:.2f}\n"
+                            f"• Сигнал: {details['signal']:.2f}\n"
+                            f"• Качество: {details['strength_text']}\n\n"
+                            f"🎯 TP1 (-0.9%): {target1:.8f}\n"
+                            f"🎯 TP2 (-1.5%): {target2:.8f}\n"
+                            f"⛔ Стоп: {stop_loss:.8f}"
+                        )
+                        
+                        for chat_id in list(users.keys()):
+                            if users[chat_id]['active']:
+                                send_telegram_notification(chat_id, msg, symbol, exchange_name, "TEMA_MACD")
+                    
+                except Exception as e:
+                    print(f"{exchange_name} TEMA+MACD ошибка {symbol}: {e}")
+                    continue
+
+            time.sleep(SCAN_INTERVAL)
+
+        except Exception as e:
+            print(f"{exchange_name} TEMA+MACD ошибка: {e}")
+            time.sleep(10)
+
+
+# ==================== ОБРАБОТКА TELEGRAM ====================
 def handle_telegram_updates():
-    """Обработка команд Telegram"""
     last_update_id = 0
 
     while True:
@@ -399,7 +608,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': f"✅ Вы подписались на RSI сигналы!\n\n📊 <b>Простая логика:</b>\n• RSI >= {RSI_OVERBOUGHT_THRESHOLD}\n• Сразу сигнал на шорт\n\n📍 Биржи: Binance + Bybit\n🎯 Тейк: 0.9-1.5%\n⛔ Стоп: +0.5%",
+                                'text': "✅ Вы подписались на сигналы!\n\n📊 <b>Доступные индикаторы:</b>\n\n1️⃣ <b>RSI</b>\n• Перекупленность 75+\n• Сразу сигнал на шорт\n\n2️⃣ <b>TEMA + MACD</b>\n• Цена ниже TEMA\n• MACD пересекает сигнал вниз\n\n📍 Биржи: Binance + Bybit\n🎯 Тейк: 0.9-1.5%",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -413,7 +622,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>RSI Бот</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Логика:</b>\nRSI достигает перекупленности → сигнал на шорт\n\n📍 Биржи: Binance, Bybit\n🎯 Тейк: 0.9-1.5%",
+                            'text': "🤖 <b>Команды бота:</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📊 <b>Индикаторы:</b>\n• RSI (перекупленность 75+)\n• TEMA + MACD (медвежий крест)\n\n📍 Биржи: Binance, Bybit\n🎯 Тейк: 0.9-1.5%",
                             'parse_mode': 'HTML'
                         }
                         requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -425,8 +634,7 @@ def handle_telegram_updates():
 
 
 def send_shutdown_message():
-    """Отправка сообщения о выключении"""
-    shutdown_msg = "🛑 <b>RSI бот остановлен</b>"
+    shutdown_msg = "🛑 <b>Бот остановлен</b>"
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
             try:
@@ -438,28 +646,26 @@ def send_shutdown_message():
 
 
 def main():
-    print("=" * 50)
-    print("RSI СКРИНЕР ПЕРЕКУПЛЕННОСТИ")
-    print(f"Логика: RSI >= {RSI_OVERBOUGHT_THRESHOLD} → ШОРТ")
+    print("=" * 60)
+    print("КОМБИНИРОВАННЫЙ СКРИНЕР")
+    print("RSI + TEMA + MACD")
     print("Биржи: Binance + Bybit")
-    print("=" * 50)
+    print("=" * 60)
 
     atexit.register(send_shutdown_message)
 
-    # Запускаем обработчик Telegram
     update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     update_thread.start()
 
     time.sleep(2)
 
-    # Отправляем приветствие
     startup_msg = (
-        f"🔍 <b>RSI бот запущен!</b>\n\n"
-        f"📊 <b>Логика:</b>\n"
-        f"• RSI >= {RSI_OVERBOUGHT_THRESHOLD}\n"
-        f"• Сразу сигнал на шорт\n\n"
-        f"📍 Биржи: Binance + Bybit\n"
-        f"🎯 Тейк: 0.9-1.5%"
+        "🔍 <b>Бот запущен!</b>\n\n"
+        "📊 <b>Активные индикаторы:</b>\n"
+        "1️⃣ RSI (перекупленность 75+)\n"
+        "2️⃣ TEMA + MACD (медвежий крест)\n\n"
+        "📍 Биржи: Binance + Bybit\n"
+        "🎯 Тейк: 0.9-1.5%"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
@@ -470,21 +676,18 @@ def main():
             except Exception:
                 pass
 
-    # Запускаем мониторинг для Binance и Bybit
-    binance_thread = threading.Thread(
-        target=monitor_exchange,
-        args=("Binance", fetch_binance_symbols, fetch_binance_ticker),
-        daemon=True
-    )
+    # RSI потоки
+    rsi_binance = threading.Thread(target=monitor_rsi, args=("Binance", fetch_binance_symbols, fetch_binance_ticker), daemon=True)
+    rsi_bybit = threading.Thread(target=monitor_rsi, args=("Bybit", fetch_bybit_symbols, fetch_bybit_ticker), daemon=True)
+    
+    # TEMA+MACD потоки
+    tema_binance = threading.Thread(target=monitor_tema_macd, args=("Binance", fetch_binance_symbols, fetch_binance_klines, fetch_binance_ticker), daemon=True)
+    tema_bybit = threading.Thread(target=monitor_tema_macd, args=("Bybit", fetch_bybit_symbols, fetch_bybit_klines, fetch_bybit_ticker), daemon=True)
 
-    bybit_thread = threading.Thread(
-        target=monitor_exchange,
-        args=("Bybit", fetch_bybit_symbols, fetch_bybit_ticker),
-        daemon=True
-    )
-
-    binance_thread.start()
-    bybit_thread.start()
+    rsi_binance.start()
+    rsi_bybit.start()
+    tema_binance.start()
+    tema_bybit.start()
 
     try:
         while True:
