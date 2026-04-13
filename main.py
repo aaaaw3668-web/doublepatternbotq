@@ -15,7 +15,7 @@ TIME_WINDOW = 60 * 5               # 5 минут для анализа памп
 
 # ========== НАСТРОЙКИ LONG/SHORT RATIO ==========
 LONG_SHORT_RATIO_THRESHOLD = 1.3   # Лонгов в 1.3 раза больше (65% лонгов / 35% шортов)
-# Формула: buy_ratio / sell_ratio >= 1.3
+LONG_SHORT_CACHE_TIME = 300        # Кешировать данные на 5 минут (чтобы не спамить API)
 
 # ========== НАСТРОЙКИ ЛИКВИДАЦИЙ ==========
 MIN_LIQUIDATION_VOLUME = {
@@ -54,6 +54,7 @@ users = {
 
 historical_prices = {}
 liquidation_data = {}
+long_short_cache = {}  # Кеш для Long/Short Ratio
 data_lock = threading.Lock()
 symbols_list = []
 websocket_connections = {}
@@ -85,6 +86,8 @@ def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retri
             response = requests.get(url, params=params, timeout=timeout)
             if response.status_code == 200:
                 return response
+            else:
+                print(f"HTTP {response.status_code} для {url}")
         except Exception as e:
             print(f"Попытка {attempt + 1}: {e}")
 
@@ -160,11 +163,21 @@ def send_telegram_notification(chat_id, message, symbol, exchange):
         return False
 
 
-# ==================== LONG/SHORT RATIO ====================
+# ==================== LONG/SHORT RATIO (С КЕШИРОВАНИЕМ) ====================
 def fetch_long_short_ratio(symbol):
-    """Получает Long/Short Ratio с Bybit (бесплатно)"""
+    """
+    Получает Long/Short Ratio с Bybit с кешированием.
+    Данные обновляются раз в 5 минут, чтобы не превышать лимиты API.
+    """
     try:
+        current_time = time.time()
         clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+        
+        # Проверяем кеш
+        if clean_symbol in long_short_cache:
+            cache_time, cached_ratio, cached_buy, cached_sell = long_short_cache[clean_symbol]
+            if current_time - cache_time < LONG_SHORT_CACHE_TIME:
+                return cached_ratio, cached_buy, cached_sell
         
         url = "https://api.bybit.com/v5/market/account-ratio"
         params = {
@@ -175,7 +188,7 @@ def fetch_long_short_ratio(symbol):
         }
         
         response = make_request_with_retry(url, params)
-        if response:
+        if response and response.status_code == 200:
             data = response.json()
             if data.get('retCode') == 0 and data.get('result', {}).get('list'):
                 item = data['result']['list'][0]
@@ -187,7 +200,21 @@ def fetch_long_short_ratio(symbol):
                 else:
                     ratio = 1.0
                 
+                # Сохраняем в кеш
+                long_short_cache[clean_symbol] = (current_time, ratio, buy_ratio, sell_ratio)
+                
                 return ratio, buy_ratio, sell_ratio
+            else:
+                # Если ошибка API, возвращаем нейтральное значение и кешируем
+                long_short_cache[clean_symbol] = (current_time, 1.0, 0.5, 0.5)
+                return 1.0, 0.5, 0.5
+        else:
+            # Если запрос не удался, используем кеш или нейтральное значение
+            if clean_symbol in long_short_cache:
+                cache_time, cached_ratio, cached_buy, cached_sell = long_short_cache[clean_symbol]
+                return cached_ratio, cached_buy, cached_sell
+            return 1.0, 0.5, 0.5
+        
     except Exception as e:
         print(f"Ошибка Long/Short для {symbol}: {e}")
     
@@ -429,7 +456,7 @@ def check_pump_and_liquidations(symbol, current_price):
         if total_volume_usdt < liq_threshold:
             return False, None
         
-        # 3. Получаем Long/Short Ratio
+        # 3. Получаем Long/Short Ratio (с кешированием)
         ls_ratio, buy_ratio, sell_ratio = fetch_long_short_ratio(symbol)
         
         if ls_ratio is None:
@@ -493,13 +520,14 @@ def monitor_pumps():
     print(f"Запуск WebSocket для {len(symbols_list)} символов...")
     for symbol in symbols_list:
         connect_liquidation_websocket(symbol)
-        time.sleep(0.1)
+        time.sleep(0.05)  # Уменьшил задержку для быстрого запуска
     
     print(f"Мониторинг {len(symbols_list)} символов")
     print(f"Пороги ликвидаций: BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}, "
           f"Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}, "
           f"Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}")
     print(f"Long/Short порог: лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз")
+    print(f"Long/Short кеш: {LONG_SHORT_CACHE_TIME} секунд")
     
     last_alert_time = {}
     error_count = 0
@@ -574,6 +602,14 @@ def monitor_pumps():
                     error_count += 1
                     continue
             
+            # Логирование каждые 5 циклов (чтобы не заспамливать консоль)
+            if int(time.time()) % 30 == 0:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Мониторинг активен...")
+            
+            if error_count > 100:
+                print(f"Много ошибок ({error_count}), перезапуск мониторинга...")
+                error_count = 0
+            
             time.sleep(SCAN_INTERVAL)
             
         except Exception as e:
@@ -617,7 +653,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации + Дисбаланс»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние: от $50,000\n• Мелкие: от $5,000\n\n3️⃣ <b>Long/Short дисбаланс</b>\n• Лонгов > шортов в 1.3x раза\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n\n📍 Биржи: Binance (цены) + Bybit (данные)",
+                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации + Дисбаланс»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние: от $50,000\n• Мелкие: от $5,000\n\n3️⃣ <b>Long/Short дисбаланс</b>\n• Лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n\n📍 Биржи: Binance (цены) + Bybit (данные)",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -665,11 +701,13 @@ def main():
 
     atexit.register(send_shutdown_message)
 
+    # Запускаем обработчик Telegram
     update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     update_thread.start()
 
     time.sleep(2)
 
+    # Отправляем приветствие
     startup_msg = (
         f"🔍 <b>Скринер запущен!</b>\n\n"
         f"📊 <b>Условия для шорта:</b>\n"
@@ -681,7 +719,8 @@ def main():
         f"• Лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз\n\n"
         f"🎯 <b>Адаптивные цели:</b>\n"
         f"• TP: от {MIN_TP}% до {MAX_TP}%\n"
-        f"• SL: от {MIN_SL}% до {MAX_SL}%"
+        f"• SL: от {MIN_SL}% до {MAX_SL}%\n\n"
+        f"💡 Long/Short данные кешируются на {LONG_SHORT_CACHE_TIME} секунд"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
@@ -692,6 +731,7 @@ def main():
             except Exception:
                 pass
 
+    # Запускаем мониторинг
     monitor_pumps()
 
 
