@@ -13,23 +13,22 @@ TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 PUMP_THRESHOLD = 2.0               # Памп от 2% за 5 минут
 TIME_WINDOW = 60 * 5               # 5 минут для анализа пампа
 
-# ========== НАСТРОЙКИ ЛИКВИДАЦИЙ (ПО ОБЪЁМУ) ==========
-# Минимальный объём ликвидаций шортов за минуту (в USDT)
+# ========== НАСТРОЙКИ LONG/SHORT RATIO ==========
+LONG_SHORT_RATIO_THRESHOLD = 1.3   # Лонгов в 1.3 раза больше (65% лонгов / 35% шортов)
+# Формула: buy_ratio / sell_ratio >= 1.3
+
+# ========== НАСТРОЙКИ ЛИКВИДАЦИЙ ==========
 MIN_LIQUIDATION_VOLUME = {
     'large': 500000,    # BTC/ETH: $500k+
     'mid': 50000,       # Средние: $50k+
     'small': 5000       # Мелкие: $5k+
 }
 
-# Альтернатива: процент от 24h объёма (включи если хочешь)
-USE_VOLUME_PERCENT = False          # False = используем фиксированные суммы
-LIQUIDATION_VOLUME_PERCENT = 0.5    # 0.5% от 24h объёма (если USE_VOLUME_PERCENT = True)
-
 # ========== НАСТРОЙКИ АДАПТИВНЫХ ЦЕЛЕЙ ==========
-MIN_TP = 0.6                       # Минимальный тейк (%)
-MAX_TP = 2.5                       # Максимальный тейк (%)
-MIN_SL = 0.4                       # Минимальный стоп (%)
-MAX_SL = 1.2                       # Максимальный стоп (%)
+MIN_TP = 0.6
+MAX_TP = 2.5
+MIN_SL = 0.4
+MAX_SL = 1.2
 
 # Общие настройки
 MIN_PRICE = 0.01
@@ -76,25 +75,8 @@ def get_asset_category(symbol):
 
 
 def get_liquidation_threshold_volume(symbol):
-    """Возвращает минимальный объём ликвидаций в USDT для актива"""
     category = get_asset_category(symbol)
-    return MIN_LIQUIDATION_VOLUME.get(category, 5000)  # По умолчанию $5000
-
-
-def fetch_24h_volume(symbol):
-    """Получает 24h объём торгов в USDT для расчёта процента"""
-    try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        params = {"symbol": symbol}
-        response = make_request_with_retry(url, params)
-        if response:
-            data = response.json()
-            # Объём в USDT (quoteVolume)
-            volume_usdt = float(data.get('quoteVolume', 0))
-            return volume_usdt
-    except Exception as e:
-        print(f"Ошибка получения объёма для {symbol}: {e}")
-    return 0
+    return MIN_LIQUIDATION_VOLUME.get(category, 5000)
 
 
 def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
@@ -178,6 +160,40 @@ def send_telegram_notification(chat_id, message, symbol, exchange):
         return False
 
 
+# ==================== LONG/SHORT RATIO ====================
+def fetch_long_short_ratio(symbol):
+    """Получает Long/Short Ratio с Bybit (бесплатно)"""
+    try:
+        clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+        
+        url = "https://api.bybit.com/v5/market/account-ratio"
+        params = {
+            "category": "linear",
+            "symbol": clean_symbol,
+            "period": "5min",
+            "limit": 1
+        }
+        
+        response = make_request_with_retry(url, params)
+        if response:
+            data = response.json()
+            if data.get('retCode') == 0 and data.get('result', {}).get('list'):
+                item = data['result']['list'][0]
+                buy_ratio = float(item.get('buy_ratio', 0.5))
+                sell_ratio = float(item.get('sell_ratio', 0.5))
+                
+                if sell_ratio > 0:
+                    ratio = buy_ratio / sell_ratio
+                else:
+                    ratio = 1.0
+                
+                return ratio, buy_ratio, sell_ratio
+    except Exception as e:
+        print(f"Ошибка Long/Short для {symbol}: {e}")
+    
+    return None, None, None
+
+
 # ==================== РАСЧЁТ АДАПТИВНЫХ ЦЕЛЕЙ ====================
 def calculate_volatility(prices):
     if len(prices) < 10:
@@ -198,22 +214,25 @@ def calculate_volatility(prices):
     return max(0.3, min(3.0, volatility_pct))
 
 
-def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, current_price, symbol):
-    """Расчёт адаптивных TP и SL на основе объёма ликвидаций"""
+def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, ls_ratio, current_price, symbol):
+    """Расчёт адаптивных TP и SL на основе всех факторов"""
     volatility = calculate_volatility(prices)
     category = get_asset_category(symbol)
     
-    # Базовый фактор от волатильности
+    # Фактор волатильности
     vol_factor = volatility / 1.0
     
-    # Фактор от силы пампа
+    # Фактор пампа
     pump_factor = min(1.5, pump_pct / 2.0)
     
-    # Фактор от объёма ликвидаций (чем больше объём, тем сильнее сигнал)
+    # Фактор ликвидаций
     liq_threshold = get_liquidation_threshold_volume(symbol)
     liq_factor = min(1.5, 1.0 + (liquidation_volume_usdt / liq_threshold) * 0.5)
     
-    # Фактор от категории актива
+    # Фактор Long/Short Ratio (чем больше дисбаланс, тем сильнее сигнал)
+    ls_factor = min(1.5, 1.0 + (ls_ratio - 1.0) * 0.5)
+    
+    # Фактор категории
     if category == 'large':
         category_factor = 0.7
     elif category == 'mid':
@@ -222,11 +241,11 @@ def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, curren
         category_factor = 1.3
     
     # Расчёт TP1
-    tp1_base = 0.8 * pump_factor * liq_factor * category_factor
+    tp1_base = 0.8 * pump_factor * liq_factor * ls_factor * category_factor
     tp1_pct = max(MIN_TP, min(MAX_TP * 0.8, tp1_base))
     
     # Расчёт TP2
-    tp2_base = 1.2 * pump_factor * liq_factor * category_factor
+    tp2_base = 1.2 * pump_factor * liq_factor * ls_factor * category_factor
     tp2_pct = max(tp1_pct + 0.3, min(MAX_TP, tp2_base))
     
     # Расчёт стоп-лосса
@@ -237,7 +256,8 @@ def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, curren
     success_prob = 50
     success_prob += min(20, pump_pct * 5)
     success_prob += min(25, (liquidation_volume_usdt / liq_threshold) * 15)
-    success_prob = min(90, success_prob)
+    success_prob += min(15, (ls_ratio - 1.0) * 30)
+    success_prob = min(95, success_prob)
     
     # Risk/Reward
     avg_tp = (tp1_pct + tp2_pct) / 2
@@ -275,7 +295,7 @@ def on_liquidation_message(ws, message, symbol):
                     if 'Short' in side or side == 'Sell':
                         size = float(liq.get('size', 0))
                         price = float(liq.get('price', 0))
-                        volume_usdt = size * price  # Объём ликвидации в USDT
+                        volume_usdt = size * price
                         
                         liquidation_data[symbol].append({
                             'time': current_time,
@@ -383,19 +403,18 @@ def fetch_binance_symbols():
 # ==================== ОСНОВНАЯ ЛОГИКА ====================
 def check_pump_and_liquidations(symbol, current_price):
     try:
-        # Получаем историю цен
+        # 1. Получаем историю цен и проверяем памп
         prices = fetch_binance_klines(symbol, limit=6)
         if prices is None or len(prices) < 2:
             return False, None
         
-        # Проверяем памп
         price_5min_ago = prices[-2] if len(prices) >= 2 else prices[0]
         pump_pct = ((current_price - price_5min_ago) / price_5min_ago) * 100
         
         if pump_pct < PUMP_THRESHOLD:
             return False, None
         
-        # Получаем общий объём ликвидаций шортов за последнюю минуту
+        # 2. Получаем объём ликвидаций шортов
         with data_lock:
             total_volume_usdt = 0
             current_time = time.time()
@@ -405,24 +424,34 @@ def check_pump_and_liquidations(symbol, current_price):
                     if current_time - liq['time'] <= 60:
                         total_volume_usdt += liq['volume_usdt']
         
-        # Проверяем порог по объёму
         liq_threshold = get_liquidation_threshold_volume(symbol)
         
         if total_volume_usdt < liq_threshold:
             return False, None
         
-        # Рассчитываем адаптивные цели
-        targets = calculate_adaptive_targets(prices, pump_pct, total_volume_usdt, current_price, symbol)
+        # 3. Получаем Long/Short Ratio
+        ls_ratio, buy_ratio, sell_ratio = fetch_long_short_ratio(symbol)
         
-        # Определяем силу сигнала
+        if ls_ratio is None:
+            return False, None
+        
+        if ls_ratio < LONG_SHORT_RATIO_THRESHOLD:
+            return False, None
+        
+        # 4. Рассчитываем адаптивные цели
+        targets = calculate_adaptive_targets(prices, pump_pct, total_volume_usdt, ls_ratio, current_price, symbol)
+        
+        # 5. Определяем силу сигнала
         volume_ratio = total_volume_usdt / liq_threshold
-        if volume_ratio >= 5:
+        ls_excess = ls_ratio - 1.0
+        
+        if volume_ratio >= 5 and ls_excess >= 0.5:
             strength_emoji = "🔴🔴🔴"
             strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
-        elif volume_ratio >= 3:
+        elif volume_ratio >= 3 or ls_excess >= 0.3:
             strength_emoji = "🔴🔴"
             strength_text = "ОЧЕНЬ СИЛЬНЫЙ"
-        elif volume_ratio >= 1.5:
+        elif volume_ratio >= 1.5 or ls_excess >= 0.15:
             strength_emoji = "🔴"
             strength_text = "СИЛЬНЫЙ"
         else:
@@ -433,6 +462,9 @@ def check_pump_and_liquidations(symbol, current_price):
             'pump_pct': pump_pct,
             'total_volume_usdt': total_volume_usdt,
             'liq_threshold': liq_threshold,
+            'ls_ratio': ls_ratio,
+            'buy_ratio': buy_ratio,
+            'sell_ratio': sell_ratio,
             'current_price': current_price,
             'strength_emoji': strength_emoji,
             'strength_text': strength_text,
@@ -450,7 +482,7 @@ def check_pump_and_liquidations(symbol, current_price):
 def monitor_pumps():
     global symbols_list
     
-    print("🚀 Запуск мониторинга памп + ликвидации (по объёму)...")
+    print("🚀 Запуск мониторинга памп + ликвидации + Long/Short...")
     
     symbols_list = fetch_binance_symbols()
     if not symbols_list:
@@ -467,6 +499,7 @@ def monitor_pumps():
     print(f"Пороги ликвидаций: BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}, "
           f"Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}, "
           f"Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}")
+    print(f"Long/Short порог: лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз")
     
     last_alert_time = {}
     error_count = 0
@@ -502,18 +535,20 @@ def monitor_pumps():
                         
                         prob_bar = "█" * (t['success_probability'] // 10) + "░" * (10 - t['success_probability'] // 10)
                         
-                        # Форматируем объём ликвидаций
                         liq_volume_formatted = f"${details['total_volume_usdt']:,.0f}"
                         liq_threshold_formatted = f"${details['liq_threshold']:,.0f}"
+                        buy_pct = details['buy_ratio'] * 100
+                        sell_pct = details['sell_ratio'] * 100
                         
                         msg = (
-                            f"{details['strength_emoji']} <b>ПАМП + ЛИКВИДАЦИИ ШОРТОВ</b> {details['strength_emoji']}\n\n"
+                            f"{details['strength_emoji']} <b>ПАМП + ЛИКВИДАЦИИ + ДИСБАЛАНС</b> {details['strength_emoji']}\n\n"
                             f"Монета: <code>{symbol}</code> (Binance)\n"
                             f"{cat_emoji} Категория: {cat_text}\n"
                             f"💰 Цена: {current_price:.8f}\n\n"
                             f"📊 <b>Сигнал:</b>\n"
                             f"• Памп за 5 мин: +{details['pump_pct']:.2f}%\n"
                             f"• Ликвидации шортов: {liq_volume_formatted} (порог: {liq_threshold_formatted})\n"
+                            f"• Long/Short: {buy_pct:.0f}% / {sell_pct:.0f}% (лонгов больше в {details['ls_ratio']:.2f}x)\n"
                             f"• Качество: {details['strength_text']}\n\n"
                             f"📈 <b>Адаптивные цели:</b>\n"
                             f"• Волатильность: {t['volatility']}%\n"
@@ -526,7 +561,8 @@ def monitor_pumps():
                             f"• SL ({t['sl_pct']}%): {t['sl_price']:.8f}\n\n"
                             f"💡 <b>Логика:</b>\n"
                             f"Цена выросла на {details['pump_pct']:.1f}%, выбив шортов на {liq_volume_formatted}.\n"
-                            f"Умные деньги забрали ликвидность — готовьте шорт!"
+                            f"При этом {buy_pct:.0f}% трейдеров в лонгах. Умные деньги развернут их!\n"
+                            f"Готовьте шорт!"
                         )
                         
                         for chat_id in list(users.keys()):
@@ -581,7 +617,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние монеты: от $50,000\n• Мелкие монеты: от $5,000\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n• Учитывают объём ликвидаций\n\n📍 Биржа: Binance\n🔗 WebSocket реального времени",
+                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации + Дисбаланс»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние: от $50,000\n• Мелкие: от $5,000\n\n3️⃣ <b>Long/Short дисбаланс</b>\n• Лонгов > шортов в 1.3x раза\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n\n📍 Биржи: Binance (цены) + Bybit (данные)",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -595,7 +631,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Памп + Ликвидации шортов</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Логика:</b>\n1. Памп от 2% за 5 минут\n2. Ликвидации шортов на значительную сумму\n3. → Шорт\n\n📍 Биржа: Binance",
+                            'text': "🤖 <b>Памп + Ликвидации + Дисбаланс</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Логика:</b>\n1. Памп от 2% за 5 минут\n2. Ликвидации шортов на значительную сумму\n3. Лонгов больше чем шортов\n4. → Шорт\n\n📍 Биржи: Binance + Bybit",
                             'parse_mode': 'HTML'
                         }
                         requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -607,7 +643,7 @@ def handle_telegram_updates():
 
 
 def send_shutdown_message():
-    shutdown_msg = "🛑 <b>Скринер «Памп + Ликвидации» остановлен</b>"
+    shutdown_msg = "🛑 <b>Скринер остановлен</b>"
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
             try:
@@ -621,12 +657,10 @@ def send_shutdown_message():
 # ==================== MAIN ====================
 def main():
     print("=" * 60)
-    print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ ШОРТОВ»")
+    print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ + ДИСБАЛАНС»")
     print(f"Памп: от {PUMP_THRESHOLD}% за 5 минут")
-    print("Ликвидации: по ОБЪЁМУ в USDT")
-    print(f"Пороги: крупные ${MIN_LIQUIDATION_VOLUME['large']:,}, "
-          f"средние ${MIN_LIQUIDATION_VOLUME['mid']:,}, "
-          f"мелкие ${MIN_LIQUIDATION_VOLUME['small']:,}")
+    print(f"Long/Short: лонгов больше в {LONG_SHORT_RATIO_THRESHOLD}x раз")
+    print("Ликвидации: по объёму в USDT")
     print("=" * 60)
 
     atexit.register(send_shutdown_message)
@@ -637,17 +671,17 @@ def main():
     time.sleep(2)
 
     startup_msg = (
-        f"🔍 <b>Скринер «Памп + Ликвидации» запущен!</b>\n\n"
+        f"🔍 <b>Скринер запущен!</b>\n\n"
         f"📊 <b>Условия для шорта:</b>\n"
         f"• Памп от {PUMP_THRESHOLD}% за 5 минут\n"
         f"• Ликвидации шортов на сумму от:\n"
         f"  - BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}\n"
         f"  - Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}\n"
-        f"  - Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}\n\n"
+        f"  - Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}\n"
+        f"• Лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз\n\n"
         f"🎯 <b>Адаптивные цели:</b>\n"
         f"• TP: от {MIN_TP}% до {MAX_TP}%\n"
-        f"• SL: от {MIN_SL}% до {MAX_SL}%\n\n"
-        f"📍 Биржа: Binance"
+        f"• SL: от {MIN_SL}% до {MAX_SL}%"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
