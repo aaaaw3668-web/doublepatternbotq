@@ -3,37 +3,36 @@ import time
 from datetime import datetime, date
 import threading
 import atexit
+import math
 
 # ==================== НАСТРОЙКИ ====================
-TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
+TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 
-# ========== НАСТРОЙКИ RSI (ПРОСТАЯ ЛОГИКА) ==========
-RSI_PERIOD = 14
-RSI_OVERBOUGHT_THRESHOLD = 75       # Порог перекупленности (75+)
-RSI_EXTREME_THRESHOLD = 85          # Экстремальная перекупленность (85+)
-RSI_TIME_WINDOW = 60 * 3            # 3 минуты данных
+# ========== НАСТРОЙКИ СКРИНЕРА ==========
+PUMP_THRESHOLD = 2.0               # Памп от 2% и выше
+RSI_OVERBOUGHT = 70                # RSI перекуплен от 70
+TIME_WINDOW = 60 * 5               # 5 минут для анализа
+RESISTANCE_LOOKBACK = 20           # 20 свечей для поиска сопротивления
+RESISTANCE_TOLERANCE = 0.002       # Допуск 0.2% от сопротивления
 
-# ========== НАСТРОЙКИ TEMA + MACD ==========
-TEMA_PERIOD = 9                     # Период TEMA
-MACD_FAST = 12                      # Быстрая EMA
-MACD_SLOW = 26                      # Медленная EMA
-MACD_SIGNAL = 9                     # Сигнальная линия
-TEMA_MACD_TIME_WINDOW = 60 * 5      # 5 минут данных для анализа
+# ========== НАСТРОЙКИ АДАПТИВНЫХ ЦЕЛЕЙ ==========
+MIN_TP = 0.6                       # Минимальный тейк (%)
+MAX_TP = 2.5                       # Максимальный тейк (%)
+MIN_SL = 0.4                       # Минимальный стоп (%)
+MAX_SL = 1.2                       # Максимальный стоп (%)
 
-# ========== ОБЩИЕ НАСТРОЙКИ ==========
+# Общие настройки
 MIN_PRICE = 0.01
 MAX_ALERTS_PER_DAY = 10
-SCAN_INTERVAL = 3
-
-# Защита от частых сигналов
-MIN_TIME_BETWEEN_SIGNALS = 300      # 5 минут
+SCAN_INTERVAL = 5
+MIN_TIME_BETWEEN_SIGNALS = 300
 
 # Настройки запросов
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
-# База данных пользователей
+# ==================== БАЗА ДАННЫХ ====================
 users = {
     '5296533274': {
         'active': True,
@@ -44,11 +43,10 @@ users = {
     }
 }
 
-# Глобальные структуры
-historical_data_rsi = {}
-historical_data_tema = {}
+historical_data = {}
 
 
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
     for attempt in range(max_retries):
         try:
@@ -87,21 +85,20 @@ def reset_daily_counters(chat_id):
         users[chat_id]['daily_alerts']['counts'] = {}
 
 
-def can_send_alert(chat_id, symbol, indicator):
+def can_send_alert(chat_id, symbol):
     if chat_id not in users or not users[chat_id]['active']:
         return False
 
     reset_daily_counters(chat_id)
-    key = f"{symbol}_{indicator}"
-    count = users[chat_id]['daily_alerts']['counts'].get(key, 0)
+    count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
     if count >= MAX_ALERTS_PER_DAY:
         return False
-    users[chat_id]['daily_alerts']['counts'][key] = count + 1
+    users[chat_id]['daily_alerts']['counts'][symbol] = count + 1
     return True
 
 
-def send_telegram_notification(chat_id, message, symbol, exchange, indicator):
-    if not can_send_alert(chat_id, symbol, indicator):
+def send_telegram_notification(chat_id, message, symbol, exchange):
+    if not can_send_alert(chat_id, symbol):
         return False
 
     monospace_symbol = f"<code>{symbol}</code>"
@@ -131,9 +128,9 @@ def send_telegram_notification(chat_id, message, symbol, exchange, indicator):
         return False
 
 
-# ==================== RSI ФУНКЦИИ ====================
-def calculate_rsi(prices):
-    if len(prices) < RSI_PERIOD + 1:
+# ==================== РАСЧЁТ RSI ====================
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
         return None
 
     gains = []
@@ -147,12 +144,12 @@ def calculate_rsi(prices):
             gains.append(0)
             losses.append(abs(change))
 
-    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
-    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    for i in range(RSI_PERIOD, len(gains)):
-        avg_gain = (avg_gain * (RSI_PERIOD - 1) + gains[i]) / RSI_PERIOD
-        avg_loss = (avg_loss * (RSI_PERIOD - 1) + losses[i]) / RSI_PERIOD
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
     if avg_loss == 0:
         return 100.0
@@ -162,181 +159,183 @@ def calculate_rsi(prices):
     return rsi
 
 
-def check_rsi_signal(price_values, current_price):
-    if len(price_values) < RSI_PERIOD + 1:
-        return False, None, None
+# ==================== РАСЧЁТ ВОЛАТИЛЬНОСТИ ====================
+def calculate_volatility(prices):
+    """Расчёт волатильности на основе ATR (Average True Range)"""
+    if len(prices) < 10:
+        return 1.0
     
-    if current_price < MIN_PRICE:
-        return False, None, None
+    changes = []
+    for i in range(1, len(prices)):
+        change = abs(prices[i] - prices[i-1])
+        changes.append(change)
     
-    rsi = calculate_rsi(price_values)
-    if rsi is None or rsi < RSI_OVERBOUGHT_THRESHOLD:
-        return False, None, None
+    avg_change = sum(changes) / len(changes)
+    avg_price = sum(prices) / len(prices)
     
-    if rsi >= RSI_EXTREME_THRESHOLD:
-        strength_emoji = "🔴🔴🔴"
-        strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
-    elif rsi >= RSI_OVERBOUGHT_THRESHOLD:
-        strength_emoji = "🔴🔴"
-        strength_text = "СИЛЬНЫЙ"
+    if avg_price == 0:
+        return 1.0
+    
+    volatility_pct = (avg_change / avg_price) * 100
+    return max(0.3, min(3.0, volatility_pct))
+
+
+def calculate_volume_profile(volumes):
+    """Анализ объёмов для оценки силы движения"""
+    if len(volumes) < 5:
+        return "normal"
+    
+    avg_volume = sum(volumes[-5:-1]) / 4
+    current_volume = volumes[-1]
+    
+    if current_volume > avg_volume * 2:
+        return "extremely_high"
+    elif current_volume > avg_volume * 1.5:
+        return "very_high"
+    elif current_volume > avg_volume * 1.2:
+        return "high"
+    elif current_volume < avg_volume * 0.5:
+        return "low"
     else:
-        strength_emoji = "🟠"
-        strength_text = "СРЕДНИЙ"
-    
-    return True, rsi, {'strength_emoji': strength_emoji, 'strength_text': strength_text}
+        return "normal"
 
 
-# ==================== TEMA + MACD ФУНКЦИИ ====================
-def calculate_ema(prices, period):
-    """Расчёт EMA"""
-    if len(prices) < period:
-        return None
-    
-    multiplier = 2 / (period + 1)
-    ema = prices[0]
-    
-    for price in prices[1:]:
-        ema = (price - ema) * multiplier + ema
-    
-    return ema
-
-
-def calculate_ema_series(prices, period):
-    """Расчёт серии EMA для всех цен"""
-    if len(prices) < period:
-        return None
-    
-    multiplier = 2 / (period + 1)
-    ema_values = [prices[0]]
-    
-    for price in prices[1:]:
-        ema = (price - ema_values[-1]) * multiplier + ema_values[-1]
-        ema_values.append(ema)
-    
-    return ema_values
-
-
-def calculate_tema(prices, period=TEMA_PERIOD):
-    """Triple Exponential Moving Average"""
-    if len(prices) < period * 3:
-        return None
-    
-    # EMA1
-    ema1 = calculate_ema_series(prices, period)
-    if ema1 is None:
-        return None
-    
-    # EMA2 (от EMA1)
-    ema2 = calculate_ema_series(ema1, period)
-    if ema2 is None:
-        return None
-    
-    # EMA3 (от EMA2)
-    ema3 = calculate_ema_series(ema2, period)
-    if ema3 is None:
-        return None
-    
-    # TEMA = 3*EMA1 - 3*EMA2 + EMA3
-    tema = [3*ema1[i] - 3*ema2[i] + ema3[i] for i in range(len(prices))]
-    
-    return tema
-
-
-def calculate_macd(prices):
-    """Расчёт MACD и сигнальной линии"""
-    if len(prices) < MACD_SLOW + MACD_SIGNAL:
-        return None, None, None
-    
-    # Быстрая EMA (12)
-    fast_ema = calculate_ema_series(prices, MACD_FAST)
-    # Медленная EMA (26)
-    slow_ema = calculate_ema_series(prices, MACD_SLOW)
-    
-    if fast_ema is None or slow_ema is None:
-        return None, None, None
-    
-    # MACD линия = Fast - Slow
-    macd_line = [fast_ema[i] - slow_ema[i] for i in range(len(prices))]
-    
-    # Сигнальная линия (EMA от MACD, период 9)
-    signal_line = calculate_ema_series(macd_line, MACD_SIGNAL)
-    
-    if signal_line is None:
-        return None, None, None
-    
-    # Гистограмма
-    histogram = [macd_line[i] - signal_line[i] for i in range(len(prices))]
-    
-    return macd_line, signal_line, histogram
-
-
-def check_tema_macd_signal(prices, current_price):
+# ==================== АДАПТИВНЫЕ ЦЕЛИ ====================
+def calculate_adaptive_targets(prices, volumes, pump_pct, rsi, resistance_level, current_price):
     """
-    Сигнал для шорта:
-    - Цена ниже TEMA (медвежий тренд)
-    - MACD пересекает сигнальную линию сверху вниз
+    Расчёт адаптивных TP и SL на основе:
+    - Волатильности актива
+    - Силы пампа
+    - Уровня RSI
+    - Расстояния до сопротивления
+    - Объёмов
     """
-    if len(prices) < 50:
-        return False, None
+    # 1. Базовая волатильность
+    volatility = calculate_volatility(prices)
     
-    if current_price < MIN_PRICE:
-        return False, None
+    # 2. Коррекция на силу пампа (чем сильнее памп, тем глубже коррекция)
+    pump_factor = min(1.5, pump_pct / 2.0)  # Памп 4% → фактор 2.0
     
-    # Рассчитываем TEMA
-    tema_values = calculate_tema(prices)
-    if tema_values is None or len(tema_values) < 10:
-        return False, None
+    # 3. Коррекция на RSI (чем выше RSI, тем сильнее разворот)
+    if rsi >= 85:
+        rsi_factor = 1.5
+    elif rsi >= 80:
+        rsi_factor = 1.2
+    elif rsi >= 75:
+        rsi_factor = 1.0
+    else:
+        rsi_factor = 0.8
     
-    # Рассчитываем MACD
-    macd_line, signal_line, histogram = calculate_macd(prices)
-    if macd_line is None or signal_line is None:
-        return False, None
+    # 4. Расстояние до сопротивления (чем ближе, тем точнее цель)
+    distance_to_resistance = (resistance_level - current_price) / resistance_level * 100
+    if distance_to_resistance < 0.1:
+        resistance_factor = 1.2  # Почти у сопротивления
+    elif distance_to_resistance < 0.3:
+        resistance_factor = 1.0
+    else:
+        resistance_factor = 0.7
     
-    current_tema = tema_values[-1]
-    current_macd = macd_line[-1]
-    current_signal = signal_line[-1]
-    current_histogram = histogram[-1]
-    prev_histogram = histogram[-2] if len(histogram) > 1 else 0
+    # 5. Анализ объёмов
+    volume_profile = calculate_volume_profile(volumes)
+    if volume_profile == "extremely_high":
+        volume_factor = 1.3
+    elif volume_profile == "very_high":
+        volume_factor = 1.1
+    elif volume_profile == "high":
+        volume_factor = 1.0
+    elif volume_profile == "low":
+        volume_factor = 0.6
+    else:
+        volume_factor = 0.8
     
-    # Условия для шорта:
-    # 1. Цена ниже TEMA
-    price_below_tema = current_price < current_tema
+    # 6. Расчёт итогового размера коррекции (глубина падения)
+    # TP1 (первая цель) — консервативная
+    tp1_base = 0.9 * pump_factor * rsi_factor * resistance_factor * volume_factor
+    tp1_pct = max(MIN_TP, min(MAX_TP * 0.8, tp1_base))
     
-    # 2. MACD пересекает сигнал сверху вниз (медвежий крест)
-    macd_cross_bearish = (macd_line[-2] > signal_line[-2] and 
-                          current_macd < current_signal)
+    # TP2 (вторая цель) — более агрессивная
+    tp2_base = 1.3 * pump_factor * rsi_factor * resistance_factor * volume_factor
+    tp2_pct = max(tp1_pct + 0.3, min(MAX_TP, tp2_base))
     
-    # 3. Гистограмма отрицательная
-    histogram_negative = current_histogram < 0
+    # Стоп-лосс (выше сопротивления с учётом волатильности)
+    sl_base = 0.5 + volatility * 0.5
+    sl_pct = max(MIN_SL, min(MAX_SL, sl_base))
     
-    if price_below_tema and macd_cross_bearish and histogram_negative:
-        # Оценка силы сигнала
-        if current_histogram < prev_histogram * 1.2:
-            strength_emoji = "🔴🔴"
-            strength_text = "СИЛЬНЫЙ"
-        else:
-            strength_emoji = "🟠"
-            strength_text = "СРЕДНИЙ"
-        
-        details = {
-            'current_price': current_price,
-            'current_tema': current_tema,
-            'macd': current_macd,
-            'signal': current_signal,
-            'histogram': current_histogram,
-            'price_vs_tema': ((current_price - current_tema) / current_tema) * 100,
-            'strength_emoji': strength_emoji,
-            'strength_text': strength_text
-        }
-        
-        return True, details
+    # Расчёт вероятности успеха (математическое ожидание)
+    success_probability = calculate_success_probability(pump_pct, rsi, volume_profile)
     
-    return False, None
+    # Математическое ожидание в % (риск 1% ради профита X%)
+    risk_reward_ratio = (tp1_pct + tp2_pct) / 2 / sl_pct
+    
+    return {
+        'tp1_pct': round(tp1_pct, 2),
+        'tp2_pct': round(tp2_pct, 2),
+        'sl_pct': round(sl_pct, 2),
+        'tp1_price': current_price * (1 - tp1_pct / 100),
+        'tp2_price': current_price * (1 - tp2_pct / 100),
+        'sl_price': resistance_level * (1 + sl_pct / 100),
+        'success_probability': success_probability,
+        'risk_reward': round(risk_reward_ratio, 2),
+        'volatility': round(volatility, 2),
+        'pump_factor': round(pump_factor, 2),
+        'rsi_factor': round(rsi_factor, 2)
+    }
+
+
+def calculate_success_probability(pump_pct, rsi, volume_profile):
+    """Расчёт вероятности успеха сигнала"""
+    prob = 50  # Базовая вероятность
+    
+    # Памп (чем больше, тем вероятнее коррекция)
+    if pump_pct >= 4:
+        prob += 15
+    elif pump_pct >= 3:
+        prob += 10
+    elif pump_pct >= 2:
+        prob += 5
+    
+    # RSI (чем выше, тем лучше)
+    if rsi >= 85:
+        prob += 15
+    elif rsi >= 80:
+        prob += 10
+    elif rsi >= 75:
+        prob += 5
+    
+    # Объёмы
+    if volume_profile == "extremely_high":
+        prob += 10
+    elif volume_profile == "very_high":
+        prob += 7
+    elif volume_profile == "high":
+        prob += 3
+    
+    return min(95, prob)
+
+
+# ==================== ПОИСК СОПРОТИВЛЕНИЯ ====================
+def find_resistance(prices, lookback=RESISTANCE_LOOKBACK, tolerance=RESISTANCE_TOLERANCE):
+    if len(prices) < lookback:
+        return None, 0
+    
+    period_prices = prices[-lookback:-1]
+    if not period_prices:
+        return None, 0
+    
+    resistance_level = max(period_prices)
+    return resistance_level, resistance_level
+
+
+def is_near_resistance(current_price, resistance_level, tolerance=RESISTANCE_TOLERANCE):
+    if resistance_level is None or resistance_level == 0:
+        return False
+    
+    distance_pct = abs(current_price - resistance_level) / resistance_level
+    return distance_pct <= tolerance
 
 
 # ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С БИРЖАМИ ====================
-def fetch_binance_klines(symbol, interval='1m', limit=60):
-    """Получение свечей с Binance"""
+def fetch_binance_klines(symbol, interval='5m', limit=30):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {'symbol': symbol, 'interval': interval, 'limit': limit}
@@ -345,14 +344,14 @@ def fetch_binance_klines(symbol, interval='1m', limit=60):
             data = response.json()
             if data and len(data) > 0:
                 prices = [float(candle[4]) for candle in data]
-                return prices
+                volumes = [float(candle[5]) for candle in data]
+                return prices, volumes
     except Exception as e:
         print(f"Ошибка Binance {symbol}: {e}")
-    return None
+    return None, None
 
 
-def fetch_bybit_klines(symbol, interval='1', limit=60):
-    """Получение свечей с Bybit"""
+def fetch_bybit_klines(symbol, interval='5', limit=30):
     try:
         url = "https://api.bybit.com/v5/market/kline"
         params = {'category': 'linear', 'symbol': symbol, 'interval': interval, 'limit': limit}
@@ -362,10 +361,11 @@ def fetch_bybit_klines(symbol, interval='1', limit=60):
             if data.get('retCode') == 0 and data.get('result', {}).get('list'):
                 klines = data['result']['list']
                 prices = [float(kline[3]) for kline in klines]
-                return prices
+                volumes = [float(kline[4]) for kline in klines]
+                return prices, volumes
     except Exception as e:
         print(f"Ошибка Bybit {symbol}: {e}")
-    return None
+    return None, None
 
 
 def fetch_binance_symbols():
@@ -401,7 +401,7 @@ def fetch_bybit_symbols():
     return []
 
 
-def fetch_binance_ticker(symbol):
+def fetch_binance_current_price(symbol):
     try:
         url = "https://api.binance.com/api/v3/ticker/price"
         params = {"symbol": symbol}
@@ -410,11 +410,11 @@ def fetch_binance_ticker(symbol):
             data = response.json()
             return float(data['price'])
     except Exception as e:
-        print(f"Ошибка Binance ticker {symbol}: {e}")
+        print(f"Ошибка Binance price {symbol}: {e}")
     return None
 
 
-def fetch_bybit_ticker(symbol):
+def fetch_bybit_current_price(symbol):
     try:
         url = "https://api.bybit.com/v5/market/tickers"
         params = {"category": "linear", "symbol": symbol}
@@ -424,151 +424,167 @@ def fetch_bybit_ticker(symbol):
             if data.get('retCode') == 0 and data.get('result', {}).get('list'):
                 return float(data['result']['list'][0]['lastPrice'])
     except Exception as e:
-        print(f"Ошибка Bybit ticker {symbol}: {e}")
+        print(f"Ошибка Bybit price {symbol}: {e}")
     return None
 
 
-# ==================== RSI МОНИТОРИНГ ====================
-def monitor_rsi(exchange_name, fetch_symbols_func, fetch_ticker_func):
-    print(f"🚀 Запуск RSI на {exchange_name}...")
+# ==================== ОСНОВНАЯ ЛОГИКА ====================
+def check_signal(prices, volumes, current_price):
+    if len(prices) < RESISTANCE_LOOKBACK + 2:
+        return False, None
+    
+    # 1. Проверка пампа
+    price_start = prices[0]
+    price_end = prices[-1]
+    
+    if price_start == 0:
+        return False, None
+    
+    pump_pct = ((price_end - price_start) / price_start) * 100
+    
+    if pump_pct < PUMP_THRESHOLD:
+        return False, None
+    
+    # 2. Поиск сопротивления
+    resistance_level, _ = find_resistance(prices)
+    
+    if resistance_level is None:
+        return False, None
+    
+    # 3. Проверка возле сопротивления
+    near_resistance = is_near_resistance(current_price, resistance_level)
+    
+    if not near_resistance:
+        return False, None
+    
+    # 4. Расчёт RSI
+    rsi = calculate_rsi(prices)
+    
+    if rsi is None or rsi < RSI_OVERBOUGHT:
+        return False, None
+    
+    # 5. Расчёт адаптивных целей
+    targets = calculate_adaptive_targets(prices, volumes, pump_pct, rsi, resistance_level, current_price)
+    
+    # Определяем силу сигнала
+    if rsi >= 85:
+        strength_emoji = "🔴🔴🔴"
+        strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
+    elif rsi >= 80:
+        strength_emoji = "🔴🔴"
+        strength_text = "ОЧЕНЬ СИЛЬНЫЙ"
+    else:
+        strength_emoji = "🔴"
+        strength_text = "СИЛЬНЫЙ"
+    
+    details = {
+        'pump_pct': pump_pct,
+        'resistance': resistance_level,
+        'rsi': rsi,
+        'current_price': current_price,
+        'strength_emoji': strength_emoji,
+        'strength_text': strength_text,
+        'distance_to_resistance': ((resistance_level - current_price) / resistance_level) * 100,
+        'targets': targets
+    }
+    
+    return True, details
+
+
+# ==================== МОНИТОРИНГ ====================
+def monitor_signal(exchange_name, fetch_symbols_func, fetch_klines_func, fetch_price_func):
+    print(f"🚀 Запуск адаптивного скринера на {exchange_name}...")
 
     symbols = fetch_symbols_func()
     if not symbols:
-        print(f"{exchange_name} RSI: нет символов")
+        print(f"{exchange_name}: не удалось получить символы")
+        time.sleep(30)
         return
 
-    for symbol in symbols:
-        key = f"{exchange_name}_{symbol}"
-        if key not in historical_data_rsi:
-            historical_data_rsi[key] = {'price': []}
-
-    print(f"{exchange_name} RSI: мониторинг {len(symbols)} символов")
+    print(f"{exchange_name}: мониторинг {len(symbols)} символов")
 
     last_alert_time = {}
+    error_count = 0
+    max_errors_before_reload = 20
 
     while True:
         try:
+            successful_scans = 0
+            
             for symbol in symbols:
                 try:
-                    current_price = fetch_ticker_func(symbol)
-                    if current_price is None:
+                    current_time_check = time.time()
+                    if symbol in last_alert_time and current_time_check - last_alert_time[symbol] < MIN_TIME_BETWEEN_SIGNALS:
                         continue
                     
-                    timestamp = int(datetime.now().timestamp())
-                    key = f"{exchange_name}_{symbol}"
-                    
-                    historical_data_rsi[key]['price'].append({'value': current_price, 'timestamp': timestamp})
-                    historical_data_rsi[key]['price'] = [
-                        x for x in historical_data_rsi[key]['price']
-                        if timestamp - x['timestamp'] <= RSI_TIME_WINDOW
-                    ]
-                    
-                    price_entries = sorted(historical_data_rsi[key]['price'], key=lambda x: x['timestamp'])
-                    price_values = [entry['value'] for entry in price_entries]
-                    
-                    is_signal, rsi, strength = check_rsi_signal(price_values, current_price)
-                    
-                    if is_signal and rsi is not None:
-                        last_time = last_alert_time.get(symbol, 0)
-                        if time.time() - last_time < MIN_TIME_BETWEEN_SIGNALS:
-                            continue
-                        
-                        last_alert_time[symbol] = time.time()
-                        
-                        target1 = current_price * 0.991
-                        target2 = current_price * 0.985
-                        stop_loss = current_price * 1.005
-                        
-                        msg = (
-                            f"{strength['strength_emoji']} <b>RSI ПЕРЕКУПЛЕННОСТЬ</b> {strength['strength_emoji']}\n\n"
-                            f"Монета: <code>{symbol}</code> ({exchange_name})\n"
-                            f"💰 Цена: {current_price:.8f}\n\n"
-                            f"📊 RSI: {rsi:.1f} | {strength['strength_text']}\n\n"
-                            f"🎯 TP1 (-0.9%): {target1:.8f}\n"
-                            f"🎯 TP2 (-1.5%): {target2:.8f}\n"
-                            f"⛔ Стоп: {stop_loss:.8f}"
-                        )
-                        
-                        for chat_id in list(users.keys()):
-                            if users[chat_id]['active']:
-                                send_telegram_notification(chat_id, msg, symbol, exchange_name, "RSI")
-                    
-                except Exception as e:
-                    print(f"{exchange_name} RSI ошибка {symbol}: {e}")
-                    continue
-
-            time.sleep(SCAN_INTERVAL)
-
-        except Exception as e:
-            print(f"{exchange_name} RSI ошибка: {e}")
-            time.sleep(10)
-
-
-# ==================== TEMA+MACD МОНИТОРИНГ ====================
-def monitor_tema_macd(exchange_name, fetch_symbols_func, fetch_klines_func, fetch_ticker_func):
-    print(f"🚀 Запуск TEMA+MACD на {exchange_name}...")
-
-    symbols = fetch_symbols_func()
-    if not symbols:
-        print(f"{exchange_name} TEMA+MACD: нет символов")
-        return
-
-    print(f"{exchange_name} TEMA+MACD: мониторинг {len(symbols)} символов")
-
-    last_alert_time = {}
-
-    while True:
-        try:
-            for symbol in symbols:
-                try:
-                    current_price = fetch_ticker_func(symbol)
-                    if current_price is None:
+                    current_price = fetch_price_func(symbol)
+                    if current_price is None or current_price < MIN_PRICE:
                         continue
                     
-                    prices = fetch_klines_func(symbol, limit=60)
-                    if prices is None or len(prices) < 50:
+                    prices, volumes = fetch_klines_func(symbol, limit=30)
+                    if prices is None or len(prices) < 15:
                         continue
                     
-                    is_signal, details = check_tema_macd_signal(prices, current_price)
+                    successful_scans += 1
+                    error_count = 0
+                    
+                    is_signal, details = check_signal(prices, volumes, current_price)
                     
                     if is_signal and details:
-                        last_time = last_alert_time.get(symbol, 0)
-                        if time.time() - last_time < MIN_TIME_BETWEEN_SIGNALS:
-                            continue
+                        last_alert_time[symbol] = current_time_check
+                        t = details['targets']
                         
-                        last_alert_time[symbol] = time.time()
-                        
-                        target1 = current_price * 0.991
-                        target2 = current_price * 0.985
-                        stop_loss = current_price * 1.005
+                        # Создаём визуализацию вероятности
+                        prob_bar = "█" * (t['success_probability'] // 10) + "░" * (10 - t['success_probability'] // 10)
                         
                         msg = (
-                            f"{details['strength_emoji']} <b>TEMA + MACD МЕДВЕЖИЙ КРОСС</b> {details['strength_emoji']}\n\n"
+                            f"{details['strength_emoji']} <b>ПАМП У СОПРОТИВЛЕНИЯ</b> {details['strength_emoji']}\n\n"
                             f"Монета: <code>{symbol}</code> ({exchange_name})\n"
                             f"💰 Цена: {current_price:.8f}\n\n"
-                            f"📊 <b>Детали:</b>\n"
-                            f"• TEMA: {details['current_tema']:.8f}\n"
-                            f"• Цена vs TEMA: {details['price_vs_tema']:.2f}%\n"
-                            f"• MACD: {details['macd']:.2f}\n"
-                            f"• Сигнал: {details['signal']:.2f}\n"
+                            f"📊 <b>Сигнал:</b>\n"
+                            f"• Памп за 5 мин: +{details['pump_pct']:.2f}%\n"
+                            f"• RSI: {details['rsi']:.1f} (перекуплен)\n"
+                            f"• Сопротивление: {details['resistance']:.8f}\n"
+                            f"• До сопротивления: {details['distance_to_resistance']:.2f}%\n"
                             f"• Качество: {details['strength_text']}\n\n"
-                            f"🎯 TP1 (-0.9%): {target1:.8f}\n"
-                            f"🎯 TP2 (-1.5%): {target2:.8f}\n"
-                            f"⛔ Стоп: {stop_loss:.8f}"
+                            f"📈 <b>Адаптивные цели (на основе волатильности):</b>\n"
+                            f"• Волатильность: {t['volatility']}%\n"
+                            f"• Вероятность успеха: {t['success_probability']}% {prob_bar}\n"
+                            f"• Risk/Reward: 1:{t['risk_reward']}\n\n"
+                            f"🎯 <b>Тейк-профит:</b>\n"
+                            f"• TP1 ({t['tp1_pct']}%): {t['tp1_price']:.8f}\n"
+                            f"• TP2 ({t['tp2_pct']}%): {t['tp2_price']:.8f}\n\n"
+                            f"⛔ <b>Стоп-лосс:</b>\n"
+                            f"• SL ({t['sl_pct']}%): {t['sl_price']:.8f} (выше сопротивления)\n\n"
+                            f"💡 <b>Математическое ожидание:</b>\n"
+                            f"Риск {t['sl_pct']}% ради профита {t['tp1_pct']}-{t['tp2_pct']}%\n"
+                            f"Ожидаемая доходность: +{t['risk_reward'] * 0.7:.2f}R"
                         )
                         
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
-                                send_telegram_notification(chat_id, msg, symbol, exchange_name, "TEMA_MACD")
+                                send_telegram_notification(chat_id, msg, symbol, exchange_name)
                     
                 except Exception as e:
-                    print(f"{exchange_name} TEMA+MACD ошибка {symbol}: {e}")
+                    print(f"{exchange_name} ошибка {symbol}: {e}")
+                    error_count += 1
                     continue
-
+            
+            if successful_scans > 0:
+                scan_rate = (successful_scans / len(symbols)) * 100 if symbols else 0
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {exchange_name}: {successful_scans}/{len(symbols)} ({scan_rate:.1f}%)")
+            
+            if error_count >= max_errors_before_reload:
+                print(f"{exchange_name}: перезагружаем символы...")
+                new_symbols = fetch_symbols_func()
+                if new_symbols:
+                    symbols = new_symbols
+                error_count = 0
+            
             time.sleep(SCAN_INTERVAL)
-
+            
         except Exception as e:
-            print(f"{exchange_name} TEMA+MACD ошибка: {e}")
+            print(f"{exchange_name} критическая ошибка: {e}")
             time.sleep(10)
 
 
@@ -608,7 +624,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': "✅ Вы подписались на сигналы!\n\n📊 <b>Доступные индикаторы:</b>\n\n1️⃣ <b>RSI</b>\n• Перекупленность 75+\n• Сразу сигнал на шорт\n\n2️⃣ <b>TEMA + MACD</b>\n• Цена ниже TEMA\n• MACD пересекает сигнал вниз\n\n📍 Биржи: Binance + Bybit\n🎯 Тейк: 0.9-1.5%",
+                                'text': f"✅ Вы подписались на АДАПТИВНЫЙ скринер!\n\n📊 <b>Что нового:</b>\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL рассчитываются под каждый актив\n• Учитывают волатильность, силу пампа, RSI\n• Разные цели для разных монет\n\n📈 <b>Математическое ожидание</b>\n• Вероятность успеха сигнала\n• Risk/Reward ratio\n• Ожидаемая доходность\n\n📍 Биржи: Binance + Bybit\n⏱️ Таймфрейм: 5 минут",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -622,7 +638,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Команды бота:</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📊 <b>Индикаторы:</b>\n• RSI (перекупленность 75+)\n• TEMA + MACD (медвежий крест)\n\n📍 Биржи: Binance, Bybit\n🎯 Тейк: 0.9-1.5%",
+                            'text': "🤖 <b>Адаптивный скринер</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Как рассчитываются цели:</b>\n• Волатильность актива\n• Сила пампа (чем сильнее, тем глубже коррекция)\n• Уровень RSI\n• Анализ объёмов\n\n🎯 Тейк: от 0.6% до 2.5%\n⛔ Стоп: от 0.4% до 1.2%",
                             'parse_mode': 'HTML'
                         }
                         requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -634,7 +650,7 @@ def handle_telegram_updates():
 
 
 def send_shutdown_message():
-    shutdown_msg = "🛑 <b>Бот остановлен</b>"
+    shutdown_msg = "🛑 <b>Адаптивный скринер остановлен</b>"
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
             try:
@@ -645,10 +661,11 @@ def send_shutdown_message():
                 pass
 
 
+# ==================== MAIN ====================
 def main():
     print("=" * 60)
-    print("КОМБИНИРОВАННЫЙ СКРИНЕР")
-    print("RSI + TEMA + MACD")
+    print("АДАПТИВНЫЙ СКРИНЕР «ПАМП У СОПРОТИВЛЕНИЯ»")
+    print("TP/SL рассчитываются под каждый актив")
     print("Биржи: Binance + Bybit")
     print("=" * 60)
 
@@ -660,12 +677,16 @@ def main():
     time.sleep(2)
 
     startup_msg = (
-        "🔍 <b>Бот запущен!</b>\n\n"
-        "📊 <b>Активные индикаторы:</b>\n"
-        "1️⃣ RSI (перекупленность 75+)\n"
-        "2️⃣ TEMA + MACD (медвежий крест)\n\n"
-        "📍 Биржи: Binance + Bybit\n"
-        "🎯 Тейк: 0.9-1.5%"
+        f"🔍 <b>Адаптивный скринер запущен!</b>\n\n"
+        f"📊 <b>Условия для шорта:</b>\n"
+        f"• Памп от {PUMP_THRESHOLD}% за 5 минут\n"
+        f"• Цена возле сопротивления\n"
+        f"• RSI выше {RSI_OVERBOUGHT}\n\n"
+        f"🎯 <b>Адаптивные цели:</b>\n"
+        f"• TP рассчитывается под волатильность\n"
+        f"• Учитывается сила пампа и RSI\n"
+        f"• Разные цели для разных активов\n\n"
+        f"📍 Биржи: Binance + Bybit"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
@@ -676,18 +697,20 @@ def main():
             except Exception:
                 pass
 
-    # RSI потоки
-    rsi_binance = threading.Thread(target=monitor_rsi, args=("Binance", fetch_binance_symbols, fetch_binance_ticker), daemon=True)
-    rsi_bybit = threading.Thread(target=monitor_rsi, args=("Bybit", fetch_bybit_symbols, fetch_bybit_ticker), daemon=True)
-    
-    # TEMA+MACD потоки
-    tema_binance = threading.Thread(target=monitor_tema_macd, args=("Binance", fetch_binance_symbols, fetch_binance_klines, fetch_binance_ticker), daemon=True)
-    tema_bybit = threading.Thread(target=monitor_tema_macd, args=("Bybit", fetch_bybit_symbols, fetch_bybit_klines, fetch_bybit_ticker), daemon=True)
+    binance_thread = threading.Thread(
+        target=monitor_signal,
+        args=("Binance", fetch_binance_symbols, fetch_binance_klines, fetch_binance_current_price),
+        daemon=True
+    )
 
-    rsi_binance.start()
-    rsi_bybit.start()
-    tema_binance.start()
-    tema_bybit.start()
+    bybit_thread = threading.Thread(
+        target=monitor_signal,
+        args=("Bybit", fetch_bybit_symbols, fetch_bybit_klines, fetch_bybit_current_price),
+        daemon=True
+    )
+
+    binance_thread.start()
+    bybit_thread.start()
 
     try:
         while True:
