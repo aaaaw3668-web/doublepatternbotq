@@ -10,13 +10,20 @@ TELEGRAM_CHAT_ID = '5296533274'
 LIQUIDATION_THRESHOLD = 5000  # Минимальная сумма ликвидации в USD
 TEST_MODE = False
 
-# Топ-25 монет по рыночной капитализации
-TOP_25_COINS = {
-    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-    'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
-    'MATICUSDT', 'SHIBUSDT', 'LTCUSDT', 'BCHUSDT', 'ATOMUSDT',
-    'UNIUSDT', 'XLMUSDT', 'XMRUSDT', 'ETCUSDT', 'FILUSDT',
-    'APTUSDT', 'HBARUSDT', 'NEARUSDT', 'VETUSDT', 'OPUSDT', 'BTCUSDC'
+# ТОП-100 МОНЕТ ПО КАПИТАЛИЗАЦИИ
+TOP_100_COINS = {
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'TRXUSDT', 'AVAXUSDT', 'SHIBUSDT',
+    'DOTUSDT', 'LINKUSDT', 'BCHUSDT', 'LTCUSDT', 'MATICUSDT', 'UNIUSDT', 'ATOMUSDT', 'XLMUSDT', 'ETCUSDT', 'FILUSDT',
+    'APTUSDT', 'ICPUSDT', 'HBARUSDT', 'NEARUSDT', 'VETUSDT', 'ALGOUSDT', 'ARBUSDT', 'GRTUSDT', 'RNDRUSDT', 'STXUSDT',
+    'AAVEUSDT', 'MKRUSDT', 'CROUSDT', 'FTMUSDT', 'THETAUSDT', 'RUNEUSDT', 'FLOWUSDT', 'QNTUSDT', 'EGLDUSDT', 'CHZUSDT',
+    'SANDUSDT', 'GALAUSDT', 'MANAUSDT', 'AXSUSDT', 'ENJUSDT', 'ZECUSDT', 'XTZUSDT', 'KSMUSDT', 'WAVESUSDT', 'ZILUSDT',
+    'DYDXUSDT', 'COMPUSDT', 'SNXUSDT', 'CAKEUSDT', '1INCHUSDT', 'CRVUSDT', 'SUSHIUSDT', 'YFIUSDT', 'UMAUSDT', 'BATUSDT',
+    'OCEANUSDT', 'ANKRUSDT', 'SKLUSDT', 'CELOUSDT', 'NEXOUSDT', 'LRCUSDT', 'ZRXUSDT', 'KNCUSDT', 'BALUSDT', 'STMXUSDT',
+    'HOTUSDT', 'IOSTUSDT', 'COTIUSDT', 'CHRUSDT', 'ALICEUSDT', 'ILVUSDT', 'AUDIOUSDT', 'REEFUSDT', 'CTSIUSDT', 'FETUSDT',
+    'AGIXUSDT', 'RLCUSDT', 'PONDUSDT', 'CLVUSDT', 'ATAUSDT', 'FIDAUSDT', 'ORNUSDT', 'POLSUSDT', 'DUSKUSDT',
+    'CVCUSDT', 'STORJUSDT', 'BLZUSDT', 'VTHOUSDT', 'WINUSDT', 'SXPUSDT', 'TLMUSDT', 'TWTUSDT', 'BTTUSDT', '1000PEPEUSDT',
+    'BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'XRPUSDC', 'DOGEUSDC', 'ADAUSDC', 'AVAXUSDC', 'DOTUSDC', 'LINKUSDC', 'MATICUSDC',
+    'UNIUSDC', 'ATOMUSDC', 'LTCUSDC', 'BCHUSDC', 'NEARUSDC', 'APTUSDC', 'ARBUSDC', 'OPUSDC', 'FILUSDC', 'HBARUSDC', 'RAVEUSDT'
 }
 
 
@@ -28,9 +35,11 @@ def log(message):
 def generate_links(symbol):
     """Генерация ссылок на аналитические ресурсы"""
     clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+    # Исправленная ссылка Coinglass TV (как у тебя было раньше)
+    coinglass_symbol = f"Binance_{symbol}"
     return {
-        'coinglass': f"https://www.coinglass.com/pro/futures/LiquidationHeatMapModel3?coin={clean_symbol}&type=pair",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}",
+        'coinglass': f"https://www.coinglass.com/tv/{coinglass_symbol}",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol}",
         'binance': f"https://www.binance.com/ru/trade/{symbol}",
         'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
     }
@@ -47,7 +56,7 @@ def send_telegram_alert(message, symbol):
         message_with_links = (
             f"{message}\n\n"
             f"🔗 <b>Быстрый анализ:</b>\n"
-            f"• 📊 <a href='{links['coinglass']}'>Coinglass</a>\n"
+            f"• 📊 <a href='{links['coinglass']}'>Coinglass TV</a>\n"
             f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
             f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
             f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
@@ -73,9 +82,9 @@ def send_telegram_alert(message, symbol):
         return False
 
 
-def is_top_coin(symbol):
-    """Проверяем, является ли монета топ-25"""
-    return symbol in TOP_25_COINS
+def is_top_100_coin(symbol):
+    """Проверяем, является ли монета топ-100 по капитализации"""
+    return symbol in TOP_100_COINS
 
 
 def on_message(ws, message):
@@ -99,9 +108,9 @@ def on_message(ws, message):
             liq = data['o']
             symbol = liq.get('s', 'UNKNOWN')
 
-            # Проверяем, не является ли монета топ-25
-            if is_top_coin(symbol):
-                log(f"Игнорируем топ-монету: {symbol}")
+            # Проверяем, является ли монета топ-100 (игнорируем если ДА)
+            if is_top_100_coin(symbol):
+                log(f"Игнорируем топ-100 монету: {symbol}")
                 return
 
             side = liq.get('S')  # 'BUY' или 'SELL'
@@ -121,7 +130,7 @@ def on_message(ws, message):
                     f"🔴 Ликвидировано SHORT: <code>${usd_value:,.0f}</code>\n"
                     f"💰 Цена ликвидации: <code>{price:.2f}</code>\n"
                     f"🕒 Время: <code>{time_stamp}</code>\n"
-                    f"📊 Не топ-25 монета"
+                    f"📊 Не топ-100 монета"
                 )
                 send_telegram_alert(msg, symbol)
             else:
@@ -149,7 +158,7 @@ def on_close(ws, close_status_code, close_msg):
 def on_open(ws):
     log("Успешное подключение к Binance WebSocket")
     send_telegram_alert(
-        "🔌 Бот запущен и подключен к Binance\n\n📈 Отслеживаю SHORT ликвидации (когда цена растет) для НЕ топ-25 монет",
+        f"🔌 Бот запущен и подключен к Binance\n\n📈 Отслеживаю SHORT ликвидации (когда цена растет) для НЕ топ-100 монет\n\n📊 Игнорируется {len(TOP_100_COINS)} монет",
         "SYSTEM")
     if TEST_MODE:
         log("Тестовый режим активирован")
@@ -170,8 +179,9 @@ def connect_websocket():
 
 if __name__ == "__main__":
     log("Запуск бота ликвидаций")
-    log(f"Игнорируемые монеты: {len(TOP_25_COINS)} топовых")
+    log(f"Игнорируемые монеты: {len(TOP_100_COINS)} топ-100")
     log("Отслеживаю только SHORT ликвидации (рост цены)")
+    log("Ссылка Coinglass TV: https://www.coinglass.com/tv/Binance_XXX")
 
     try:
         import websocket
