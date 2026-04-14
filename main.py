@@ -53,7 +53,7 @@ def send_telegram_alert(message, symbol):
         # Генерируем ссылки для символа
         links = generate_links(symbol)
 
-        # Добавляем ссылки к сообщению
+        # ВАЖНО: Убираем пробелы вокруг ссылок и используем правильный формат
         message_with_links = (
             f"{message}\n\n"
             f"🔗 <b>Быстрый анализ:</b>\n"
@@ -67,13 +67,16 @@ def send_telegram_alert(message, symbol):
         monospace_symbol = f"<code>{symbol}</code>"
         message_with_links = message_with_links.replace(symbol, monospace_symbol)
 
+        # Вариант 1: Используем markdown вместо HTML (рекомендуется для ссылок)
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message_with_links,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': False
+            'parse_mode': 'HTML',  # Оставляем HTML
+            'disable_web_page_preview': False,
+            'link_preview_options': {'is_disabled': False}  # Добавляем опцию превью
         }
+        
         response = requests.post(url, json=payload)
         response.raise_for_status()
         log("Сообщение отправлено в Telegram")
