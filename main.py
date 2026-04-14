@@ -1,484 +1,184 @@
-import requests
+from websocket import WebSocketApp
+import json
 import time
-from datetime import datetime, date
-import urllib.parse
-import threading
-import atexit
+import requests
+from datetime import datetime
 
 # Настройки
-TELEGRAM_BOT_TOKEN = '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I'
-PRICE_INCREASE_THRESHOLD = 2  # Порог для роста цены
-PRICE_DECREASE_THRESHOLD = -50  # Порог для падения цены
-TIME_WINDOW = 60 * 5
-MAX_ALERTS_PER_DAY = 10
+TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
+TELEGRAM_CHAT_ID = '5296533274'
+LIQUIDATION_THRESHOLD = 15000  # Минимальная сумма ликвидации в USD
+TEST_MODE = False
 
-# Настройки запросов
-REQUEST_TIMEOUT = 10  # Таймаут для всех запросов
-MAX_RETRIES = 3  # Максимальное количество попыток
-RETRY_DELAY = 2  # Задержка между попытками
-
-# База данных пользователей (в памяти)
-users = {
-    '5296533274': {  # Пример пользователя
-        'active': True,
-        'daily_alerts': {
-            'date': date.today(),
-            'counts': {}
-        }
-    }
+# Топ-25 монет по рыночной капитализации
+TOP_25_COINS = {
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+    'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
+    'MATICUSDT', 'SHIBUSDT', 'LTCUSDT', 'BCHUSDT', 'ATOMUSDT',
+    'UNIUSDT', 'XLMUSDT', 'XMRUSDT', 'ETCUSDT', 'FILUSDT',
+    'APTUSDT', 'HBARUSDT', 'NEARUSDT', 'VETUSDT', 'OPUSDT', 'BTCUSDC'
 }
 
-# Глобальные структуры данных
-historical_data = {}
 
-
-def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
-    """Универсальная функция для запросов с повторными попытками"""
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-            if response.status_code == 200:
-                return response
-            else:
-                print(f"Попытка {attempt + 1}: Ошибка HTTP {response.status_code} для {url}")
-        except requests.exceptions.Timeout:
-            print(f"Попытка {attempt + 1}: Таймаут подключения к {url}")
-        except requests.exceptions.ConnectionError as e:
-            print(f"Попытка {attempt + 1}: Ошибка подключения к {url}: {e}")
-        except Exception as e:
-            print(f"Попытка {attempt + 1}: Неожиданная ошибка для {url}: {e}")
-
-        if attempt < max_retries - 1:
-            time.sleep(RETRY_DELAY * (attempt + 1))  # Увеличиваем задержку с каждой попыткой
-
-    return None
+def log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
 
 
 def generate_links(symbol):
     """Генерация ссылок на аналитические ресурсы"""
     clean_symbol = symbol.replace('USDT', '').replace('1000', '')
-    # Для Coinglass TV используем формат Binance_НАЗВАНИЕUSDT
-    coinglass_symbol = f"Binance_{symbol}"
     return {
-        'coinglass': f"https://www.coinglass.com/tv/{coinglass_symbol}",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol}",
-        'dextools': f"https://www.dextools.io/app/en/ether/pair-explorer/{clean_symbol}",
+        'coinglass': f"https://www.coinglass.com/pro/futures/LiquidationHeatMapModel3?coin={clean_symbol}&type=pair",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}",
         'binance': f"https://www.binance.com/ru/trade/{symbol}",
         'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
     }
 
 
-def reset_daily_counters(chat_id):
-    today = date.today()
-    if users[chat_id]['daily_alerts']['date'] != today:
-        users[chat_id]['daily_alerts']['date'] = today
-        users[chat_id]['daily_alerts']['counts'] = {}
-        print(f"Счетчики уведомлений сброшены для пользователя {chat_id}")
-
-
-def can_send_alert(chat_id, symbol):
-    if chat_id not in users or not users[chat_id]['active']:
-        return False
-
-    reset_daily_counters(chat_id)
-    count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-    if count >= MAX_ALERTS_PER_DAY:
-        return False
-    users[chat_id]['daily_alerts']['counts'][symbol] = count + 1
-    return True
-
-
-def send_telegram_notification(chat_id, message, symbol, exchange):
-    if not can_send_alert(chat_id, symbol):
-        print(f"Лимит уведомлений достигнут для {symbol} ({exchange}) у пользователя {chat_id}")
-        return False
-
-    # Используем моноширинный шрифт для символа
-    monospace_symbol = f"<code>{symbol}</code>"
-    
-    # Заменяем символ в сообщении
-    message = message.replace(symbol, monospace_symbol)
-
-    links = generate_links(symbol)
-    
-    # Формируем сообщение с кликабельными ссылками (без лишних пробелов)
-    message_with_links = (
-        f"{message}\n\n"
-        f"🔗 <b>Быстрый анализ:</b>\n"
-        f"• 📊 <a href='{links['coinglass']}'>Coinglass TV</a>\n"
-        f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
-        f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
-        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
-    )
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': chat_id,
-        'text': message_with_links,
-        'parse_mode': 'HTML',
-        'disable_web_page_preview': False,  # True - скрыть превью, False - показать
-        'link_preview_options': {
-            'is_disabled': False  # Явно разрешаем превью ссылок
-        }
-    }
+def send_telegram_alert(message, symbol):
     try:
-        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"Ошибка отправки пользователю {chat_id}: {repr(e)}")
-        return False
+        log(f"Отправка: {message[:50]}...")
 
+        # Генерируем ссылки для символа
+        links = generate_links(symbol)
 
-def calculate_change(old, new):
-    if old == 0:
-        return 0.0
-    return ((new - old) / old) * 100
+        # Добавляем ссылки к сообщению
+        message_with_links = (
+            f"{message}\n\n"
+            f"🔗 <b>Быстрый анализ:</b>\n"
+            f"• 📊 <a href='{links['coinglass']}'>Coinglass</a>\n"
+            f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
+            f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
+            f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
+        )
 
+        # Используем моноширинный шрифт для символа в сообщении
+        monospace_symbol = f"<code>{symbol}</code>"
+        message_with_links = message_with_links.replace(symbol, monospace_symbol)
 
-def fetch_binance_symbols():
-    """Получение списка символов с Binance"""
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-
-    response = make_request_with_retry(url, timeout=15)
-    if response:
-        try:
-            data = response.json()
-            symbols = []
-            for symbol_info in data['symbols']:
-                if symbol_info['quoteAsset'] == 'USDT' and symbol_info['status'] == 'TRADING':
-                    symbols.append(symbol_info['symbol'])
-            print(f"Binance: получено {len(symbols)} символов")
-            return symbols
-        except Exception as e:
-            print(f"Ошибка парсинга данных Binance: {e}")
-    else:
-        print("Не удалось получить символы с Binance после всех попыток")
-
-    return []
-
-
-def fetch_bybit_symbols():
-    """Получение списка символов с Bybit"""
-    url = "https://api.bybit.com/v5/market/instruments-info"
-    params = {"category": "linear"}
-
-    response = make_request_with_retry(url, params)
-    if response:
-        try:
-            data = response.json()
-            if data['retCode'] == 0:
-                symbols = [item['symbol'] for item in data['result']['list']]
-                print(f"Bybit: получено {len(symbols)} символов")
-                return symbols
-        except Exception as e:
-            print(f"Ошибка парсинга данных Bybit: {e}")
-    else:
-        print("Не удалось получить символы с Bybit после всех попыток")
-
-    return []
-
-
-def fetch_binance_ticker(symbol):
-    """Получение данных тикера с Binance"""
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    params = {"symbol": symbol}
-
-    response = make_request_with_retry(url, params)
-    if response:
-        try:
-            data = response.json()
-            # Проверяем, существует ли символ
-            if 'code' in data and data['code'] == -1121:
-                print(f"Символ {symbol} не найден на Binance")
-                return None
-
-            return {
-                'symbol': data['symbol'],
-                'lastPrice': float(data['lastPrice']),
-                'priceChangePercent': float(data['priceChangePercent'])
-            }
-        except Exception as e:
-            print(f"Ошибка парсинга тикера {symbol} с Binance: {e}")
-
-    return None
-
-
-def fetch_bybit_ticker(symbol):
-    """Получение данных тикера с Bybit"""
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear", "symbol": symbol}
-
-    response = make_request_with_retry(url, params)
-    if response:
-        try:
-            data = response.json()
-            if data['retCode'] == 0 and data['result']['list']:
-                ticker = data['result']['list'][0]
-                return {
-                    'symbol': ticker['symbol'],
-                    'lastPrice': float(ticker['lastPrice']),
-                    'priceChangePercent': float(ticker['price24hPcnt']) * 100
-                }
-            else:
-                print(f"Символ {symbol} не найден на Bybit: {data.get('retMsg', 'Unknown error')}")
-        except Exception as e:
-            print(f"Ошибка парсинга тикера {symbol} с Bybit: {e}")
-
-    return None
-
-
-def add_user(chat_id):
-    """Добавление нового пользователя"""
-    if chat_id not in users:
-        users[chat_id] = {
-            'active': True,
-            'daily_alerts': {
-                'date': date.today(),
-                'counts': {}
-            }
-        }
-        print(f"Добавлен новый пользователь: {chat_id}")
-
-        # Отправляем приветственное сообщение
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            'chat_id': chat_id,
-            'text': "✅ Вы успешно подписались на уведомления о торговых сигналах!",
-            'parse_mode': 'HTML'
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message_with_links,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': False
         }
-        try:
-            requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            print(f"Ошибка отправки приветствия: {e}")
-
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        log("Сообщение отправлено в Telegram")
         return True
-    return False
+    except Exception as e:
+        log(f"ОШИБКА Telegram: {str(e)}")
+        return False
 
 
-def remove_user(chat_id):
-    """Удаление пользователя"""
-    if chat_id in users:
-        del users[chat_id]
-        print(f"Пользователь {chat_id} удален")
-        return True
-    return False
+def is_top_coin(symbol):
+    """Проверяем, является ли монета топ-25"""
+    return symbol in TOP_25_COINS
 
 
-def broadcast_message(message):
-    """Отправка сообщения всем активным пользователям"""
-    for chat_id in list(users.keys()):
-        if users[chat_id]['active']:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                'chat_id': chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            try:
-                requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-            except Exception as e:
-                print(f"Ошибка отправки сообщения пользователю {chat_id}: {e}")
-
-
-def send_shutdown_message():
-    """Отправка сообщения о выключении бота"""
-    shutdown_msg = "🛑 <b>Бот остановлен</b>\n\nМониторинг приостановлен. Для возобновления работы перезапустите бота."
-    broadcast_message(shutdown_msg)
-    print("Сообщение о выключении отправлено всем пользователям")
-
-
-def handle_telegram_updates():
-    """Обработка входящих сообщений от пользователей"""
-    last_update_id = 0
-
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {'timeout': 30, 'offset': last_update_id + 1}
-            response = requests.get(url, params=params, timeout=35)  # Таймаут больше чем polling timeout
-            data = response.json()
-
-            if data['ok']:
-                for update in data['result']:
-                    last_update_id = update['update_id']
-
-                    if 'message' not in update:
-                        continue
-
-                    message = update['message']
-                    chat_id = str(message['chat']['id'])
-                    text = message.get('text', '').strip().lower()
-
-                    # Обработка команд
-                    if text == '/start':
-                        add_user(chat_id)
-                    elif text == '/stop':
-                        remove_user(chat_id)
-                        # Отправляем сообщение о отписке
-                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                        payload = {
-                            'chat_id': chat_id,
-                            'text': "❌ Вы отписались от уведомлений.",
-                            'parse_mode': 'HTML'
-                        }
-                        try:
-                            requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-                        except Exception as e:
-                            print(f"Ошибка отправки сообщения: {e}")
-                    elif text == '/help':
-                        # Отправляем справку
-                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                        payload = {
-                            'chat_id': chat_id,
-                            'text': "🤖 <b>Команды бота:</b>\n/start - подписаться на уведомления\n/stop - отписаться от уведомлений\n/help - показать эту справку",
-                            'parse_mode': 'HTML'
-                        }
-                        try:
-                            requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-                        except Exception as e:
-                            print(f"Ошибка отправки справки: {e}")
-
-            time.sleep(1)
-        except requests.exceptions.Timeout:
-            print("Таймаут при опросе Telegram API (это нормально)")
-            continue
-        except Exception as e:
-            print(f"Ошибка обработки обновлений: {e}")
-            time.sleep(5)
-
-
-def monitor_exchange(exchange_name, fetch_symbols_func, fetch_ticker_func):
-    """Мониторинг конкретной биржи"""
-    print(f"Запуск мониторинга {exchange_name}...")
-
-    symbols = fetch_symbols_func()
-    if not symbols:
-        print(f"Не удалось получить список символов с {exchange_name}")
-        time.sleep(30)
-        return
-
-    # Ограничиваем количество символов для тестирования
-
-    # Инициализация исторических данных для символов этой биржи
-    for symbol in symbols:
-        key = f"{exchange_name}_{symbol}"
-        if key not in historical_data:
-            historical_data[key] = {'price': []}
-
-    print(f"Мониторинг {exchange_name}: {len(symbols)} символов")
-
-    error_count = 0
-    max_errors_before_reload = 10
-
-    while True:
-        try:
-            successful_requests = 0
-            for symbol in symbols:
-                ticker_data = fetch_ticker_func(symbol)
-                if ticker_data:
-                    successful_requests += 1
-                    error_count = 0  # Сбрасываем счетчик ошибок при успешном запросе
-
-                    current_price = ticker_data['lastPrice']
-                    timestamp = int(datetime.now().timestamp())
-                    key = f"{exchange_name}_{symbol}"
-
-                    # Обновляем данные цены
-                    historical_data[key]['price'].append({'value': current_price, 'timestamp': timestamp})
-                    historical_data[key]['price'] = [x for x in historical_data[key]['price']
-                                                     if timestamp - x['timestamp'] <= TIME_WINDOW]
-
-                    # Проверка изменения цены
-                    if len(historical_data[key]['price']) > 1:
-                        old_price = historical_data[key]['price'][0]['value']
-                        price_change = calculate_change(old_price, current_price)
-
-                        # Сигнал на рост цены
-                        if price_change >= PRICE_INCREASE_THRESHOLD:
-                            for chat_id in list(users.keys()):
-                                if users[chat_id]['active']:
-                                    alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                    msg = (f"🚨 <b>{symbol}</b> ({exchange_name})\n"
-                                           f"📈 Рост цены: +{price_change:.2f}%\n"
-                                           f"Было: {old_price:.4f}\n"
-                                           f"Стало: {current_price:.4f}\n"
-                                           f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
-                                    send_telegram_notification(chat_id, msg, symbol, exchange_name)
-
-                        # Сигнал на падение цены
-                        elif price_change <= PRICE_DECREASE_THRESHOLD:
-                            for chat_id in list(users.keys()):
-                                if users[chat_id]['active']:
-                                    alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                    msg = (f"🔻 <b>{symbol}</b> ({exchange_name})\n"
-                                           f"📉 Падение цены: {price_change:.2f}%\n"
-                                           f"Было: {old_price:.4f}\n"
-                                           f"Стало: {current_price:.4f}\n"
-                                           f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
-                                    send_telegram_notification(chat_id, msg, symbol, exchange_name)
-                else:
-                    error_count += 1
-                    if error_count >= max_errors_before_reload:
-                        print(f"Слишком много ошибок на {exchange_name}, перезагружаем список символов...")
-                        new_symbols = fetch_symbols_func()
-                        if new_symbols:
-                            symbols = new_symbols
-                            if len(symbols) > 100:
-                                symbols = symbols[:100]
-                            print(f"Обновлен список символов: {len(symbols)} символов")
-                        error_count = 0
-                        break
-
-            success_rate = (successful_requests / len(symbols)) * 100
-            print(f"{exchange_name}: успешных запросов {successful_requests}/{len(symbols)} ({success_rate:.1f}%)")
-
-            time.sleep(5)
-
-        except Exception as e:
-            print(f"Критическая ошибка мониторинга {exchange_name}: {repr(e)}")
-            time.sleep(10)
-
-
-def main():
-    print("Запуск мониторинга цен с Binance и Bybit...")
-
-    # Регистрируем функцию для отправки сообщения при выключении
-    atexit.register(send_shutdown_message)
-
-    # Запускаем обработчик сообщений в отдельном потоке
-    update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
-    update_thread.start()
-
-    # Уведомление о запуске всем пользователям
-    broadcast_message(
-        "🔍 <b>Бот начал работу!</b>\n\nМониторинг цен активирован для Binance и Bybit с аналитическими ссылками!")
-    print("Бот успешно запущен и отправил уведомление")
-
-    # Запускаем мониторинг обеих бирж в отдельных потоках
-    binance_thread = threading.Thread(
-        target=monitor_exchange,
-        args=("Binance", fetch_binance_symbols, fetch_binance_ticker),
-        daemon=True
-    )
-
-    bybit_thread = threading.Thread(
-        target=monitor_exchange,
-        args=("Bybit", fetch_bybit_symbols, fetch_bybit_ticker),
-        daemon=True
-    )
-
-    binance_thread.start()
-    bybit_thread.start()
-
+def on_message(ws, message):
     try:
-        # Главный поток просто ждет завершения
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nОстановка бота...")
-        # Сообщение о выключении отправится автоматически через atexit
+        log(f"Получены данные: {message[:100]}...")
+
+        data = json.loads(message)
+
+        if TEST_MODE:
+            log("Тестовый режим: отправка fake-ликвидации")
+            test_message = (
+                f"⚡️ <b>ТЕСТОВОЕ УВЕДОМЛЕНИЕ</b>\n"
+                f"Сторона: 🔴 SHORT\n"
+                f"Сумма: $999,999\n"
+                f"Время: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            send_telegram_alert(test_message, "TESTUSDT")
+            return
+
+        if 'e' in data and data['e'] == 'forceOrder':
+            liq = data['o']
+            symbol = liq.get('s', 'UNKNOWN')
+
+            # Проверяем, не является ли монета топ-25
+            if is_top_coin(symbol):
+                log(f"Игнорируем топ-монету: {symbol}")
+                return
+
+            side = liq.get('S')  # 'BUY' или 'SELL'
+            quantity = float(liq.get('q', 0))
+            price = float(liq.get('ap', 0))
+            usd_value = quantity * price
+            time_stamp = datetime.fromtimestamp(data.get('E', 0) / 1000).strftime('%H:%M:%S')
+
+            log(f"Обработка: {symbol} {side} ${usd_value:,.0f}")
+
+            # ФИЛЬТРАЦИЯ: отправляем только ШОРТЫ (SHORT) - когда цена растет
+            # В Binance: 'SELL' = ликвидация LONG, 'BUY' = ликвидация SHORT
+            if side == 'BUY' and usd_value >= LIQUIDATION_THRESHOLD:
+                msg = (
+                    f"📈 <b>Рост цены + Ликвидация SHORT</b>\n"
+                    f"Монета: <code>{symbol}</code>\n"
+                    f"🔴 Ликвидировано SHORT: <code>${usd_value:,.0f}</code>\n"
+                    f"💰 Цена ликвидации: <code>{price:.2f}</code>\n"
+                    f"🕒 Время: <code>{time_stamp}</code>\n"
+                    f"📊 Не топ-25 монета"
+                )
+                send_telegram_alert(msg, symbol)
+            else:
+                if side != 'BUY':
+                    log(f"Игнорируем LONG ликвидацию (падение цены): {symbol}")
+                else:
+                    log("Ликвидация ниже порога, игнорируем")
+
+    except Exception as e:
+        log(f"КРИТИЧЕСКАЯ ОШИБКА: {str(e)}")
+
+
+def on_error(ws, error):
+    log(f"ОШИБКА WebSocket: {str(error)}")
+    time.sleep(5)
+    connect_websocket()
+
+
+def on_close(ws, close_status_code, close_msg):
+    log(f"Соединение закрыто. Код: {close_status_code}, Причина: {close_msg}")
+    time.sleep(2)
+    connect_websocket()
+
+
+def on_open(ws):
+    log("Успешное подключение к Binance WebSocket")
+    send_telegram_alert(
+        "🔌 Бот запущен и подключен к Binance\n\n📈 Отслеживаю SHORT ликвидации (когда цена растет) для НЕ топ-25 монет",
+        "SYSTEM")
+    if TEST_MODE:
+        log("Тестовый режим активирован")
+
+
+def connect_websocket():
+    log("Попытка подключения к WebSocket...")
+    try:
+        ws = WebSocketApp("wss://fstream.binance.com/ws/!forceOrder@arr",
+                          on_open=on_open,
+                          on_message=on_message,
+                          on_error=on_error,
+                          on_close=on_close)
+        ws.run_forever()
+    except Exception as e:
+        log(f"ОШИБКА ПОДКЛЮЧЕНИЯ: {str(e)}")
 
 
 if __name__ == "__main__":
-    main()
+    log("Запуск бота ликвидаций")
+    log(f"Игнорируемые монеты: {len(TOP_25_COINS)} топовых")
+    log("Отслеживаю только SHORT ликвидации (рост цены)")
+
+    try:
+        import websocket
+
+        log("Все зависимости установлены")
+    except ImportError as e:
+        log(f"ОШИБКА: Не установлены зависимости - {str(e)}")
+        exit(1)
+
+    connect_websocket()
