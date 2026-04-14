@@ -3,22 +3,16 @@ import json
 import time
 import requests
 from datetime import datetime
-import os  # Добавьте эту строку
-from dotenv import load_dotenv  # Установите: pip install python-dotenv
 
-# Загружаем переменные из .env файла
-load_dotenv()
-
-# Настройки из переменных окружения
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-LIQUIDATION_THRESHOLD = 3000  # Минимальная сумма ликвидации в USD
+# Настройки
+TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
+TELEGRAM_CHAT_ID = '5296533274'
+LIQUIDATION_THRESHOLD = 50000  # Минимальная сумма ликвидации в USD
 TEST_MODE = False
 
-# Проверка наличия переменных
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print("ОШИБКА: Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
-    exit(1)
+# Кеш для Long/Short данных (чтобы не спамить API)
+long_short_cache = {}
+LONG_SHORT_CACHE_TIME = 300  # 5 минут
 
 # Топ-25 монет по рыночной капитализации
 TOP_25_COINS = {
@@ -46,14 +40,62 @@ def generate_links(symbol):
     }
 
 
+def fetch_long_short_info(symbol):
+    """Получает информацию о Long/Short Ratio с Bybit (только для справки)"""
+    try:
+        current_time = time.time()
+        clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+        
+        # Проверяем кеш
+        if clean_symbol in long_short_cache:
+            cache_time, cached_info = long_short_cache[clean_symbol]
+            if current_time - cache_time < LONG_SHORT_CACHE_TIME:
+                return cached_info
+        
+        url = "https://api.bybit.com/v5/market/account-ratio"
+        params = {
+            "category": "linear",
+            "symbol": clean_symbol,
+            "period": "5min",
+            "limit": 1
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('retCode') == 0 and data.get('result', {}).get('list'):
+                item = data['result']['list'][0]
+                buy_ratio = float(item.get('buyRatio', 0.5))
+                sell_ratio = float(item.get('sellRatio', 0.5))
+                net_delta = buy_ratio - sell_ratio  # Положительный = больше лонгов
+                
+                info = {
+                    'long_pct': round(buy_ratio * 100, 1),
+                    'short_pct': round(sell_ratio * 100, 1),
+                    'net_delta': round(net_delta * 100, 1),
+                    'dominant': 'LONGS' if net_delta > 0 else 'SHORTS'
+                }
+                
+                long_short_cache[clean_symbol] = (current_time, info)
+                log(f"Long/Short {symbol}: {info['long_pct']}% / {info['short_pct']}% (Net: {info['net_delta']:+.1f}% {info['dominant']})")
+                return info
+    except Exception as e:
+        log(f"Ошибка получения Long/Short для {symbol}: {e}")
+    
+    return None
+
+
 def send_telegram_alert(message, symbol):
     try:
         log(f"Отправка: {message[:50]}...")
 
+        # Получаем Long/Short информацию для справки
+        ls_info = fetch_long_short_info(symbol)
+        
         # Генерируем ссылки для символа
         links = generate_links(symbol)
 
-        # ВАЖНО: Убираем пробелы вокруг ссылок и используем правильный формат
+        # Добавляем ссылки к сообщению
         message_with_links = (
             f"{message}\n\n"
             f"🔗 <b>Быстрый анализ:</b>\n"
@@ -62,21 +104,28 @@ def send_telegram_alert(message, symbol):
             f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
             f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
         )
+        
+        # Добавляем информацию о Net Longs/Shorts если есть
+        if ls_info:
+            net_emoji = "🟢" if ls_info['net_delta'] > 0 else "🔴"
+            ls_text = (
+                f"\n\n📈 <b>Net Longs/Shorts (справка):</b>\n"
+                f"{net_emoji} {ls_info['dominant']}: {ls_info['net_delta']:+.1f}% "
+                f"({ls_info['long_pct']}% / {ls_info['short_pct']}%)"
+            )
+            message_with_links += ls_text
 
         # Используем моноширинный шрифт для символа в сообщении
         monospace_symbol = f"<code>{symbol}</code>"
         message_with_links = message_with_links.replace(symbol, monospace_symbol)
 
-        # Вариант 1: Используем markdown вместо HTML (рекомендуется для ссылок)
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message_with_links,
-            'parse_mode': 'HTML',  # Оставляем HTML
-            'disable_web_page_preview': False,
-            'link_preview_options': {'is_disabled': False}  # Добавляем опцию превью
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': False
         }
-        
         response = requests.post(url, json=payload)
         response.raise_for_status()
         log("Сообщение отправлено в Telegram")
@@ -162,7 +211,7 @@ def on_close(ws, close_status_code, close_msg):
 def on_open(ws):
     log("Успешное подключение к Binance WebSocket")
     send_telegram_alert(
-        "🔌 Бот запущен и подключен к Binance\n\n📈 Отслеживаю SHORT ликвидации (когда цена растет) для НЕ топ-25 монет",
+        "🔌 Бот запущен и подключен к Binance\n\n📈 Отслеживаю SHORT ликвидации (когда цена растет) для НЕ топ-25 монет\n\nℹ️ Net Longs/Shorts добавляется в сигнал как СПРАВКА (не фильтр)",
         "SYSTEM")
     if TEST_MODE:
         log("Тестовый режим активирован")
@@ -185,6 +234,7 @@ if __name__ == "__main__":
     log("Запуск бота ликвидаций")
     log(f"Игнорируемые монеты: {len(TOP_25_COINS)} топовых")
     log("Отслеживаю только SHORT ликвидации (рост цены)")
+    log("Net Longs/Shorts из Bybit API добавляется как справочная информация")
 
     try:
         import websocket
