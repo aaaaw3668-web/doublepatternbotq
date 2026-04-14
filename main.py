@@ -10,13 +10,14 @@ import atexit
 TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 
 # ========== НАСТРОЙКИ СКРИНЕРА ==========
-PUMP_THRESHOLD = 2.0               # Памп от 2% за 5 минут
+PUMP_THRESHOLD = 1.5               # Памп от 1.5% за 5 минут
 LIQUIDATION_THRESHOLD = 1000       # Минимальная сумма ликвидации $1000
+PUMP_CHECK_INTERVAL = 30           # Проверка пампа каждые 30 секунд
 
 # ========== НАСТРОЙКИ LONG/SHORT RATIO ==========
-USE_LONG_SHORT_RATIO = True        # Включить Long/Short фильтр
-LONG_SHORT_RATIO_THRESHOLD = 1.3   # Лонгов в 1.3 раза больше
-LONG_SHORT_CACHE_TIME = 300        # Кешировать на 5 минут
+USE_LONG_SHORT_RATIO = False       # Временно отключим для простоты
+LONG_SHORT_RATIO_THRESHOLD = 1.3
+LONG_SHORT_CACHE_TIME = 300
 
 # ========== НАСТРОЙКИ АДАПТИВНЫХ ЦЕЛЕЙ ==========
 MIN_TP = 0.6
@@ -46,18 +47,14 @@ users = {
 
 # Кеши и статистика
 long_short_cache = {}
-price_history_cache = {}
+pump_candidates = {}  # Словарь для хранения монет, где найден памп
 last_alert_time = {}
 
-# Статистика для логов
+# Статистика
 stats = {
-    'total_liquidations': 0,
-    'short_liquidations': 0,
-    'short_above_threshold': 0,
     'pump_checks': 0,
-    'pump_found': 0,
-    'ls_checks': 0,
-    'ls_passed': 0,
+    'pumps_found': 0,
+    'liquidations_checked': 0,
     'signals_sent': 0,
     'last_heartbeat': time.time()
 }
@@ -76,6 +73,8 @@ def log(message, level="INFO"):
         print(f"\033[94m[{timestamp}] 💀 {message}\033[0m")
     elif level == "SIGNAL":
         print(f"\033[95m[{timestamp}] 🔔 {message}\033[0m")
+    elif level == "PUMP":
+        print(f"\033[96m[{timestamp}] 📈 {message}\033[0m")
     elif level == "HEARTBEAT":
         print(f"\033[96m[{timestamp}] 💓 {message}\033[0m")
     else:
@@ -83,7 +82,7 @@ def log(message, level="INFO"):
 
 
 def log_stats():
-    log(f"СТАТИСТИКА: Ликвидаций всего: {stats['total_liquidations']}, SHORT: {stats['short_liquidations']}, Выше ${LIQUIDATION_THRESHOLD}: {stats['short_above_threshold']}, Пампов найдено: {stats['pump_found']}/{stats['pump_checks']}, Long/Short пройдено: {stats['ls_passed']}/{stats['ls_checks']}, Сигналов: {stats['signals_sent']}", "HEARTBEAT")
+    log(f"СТАТИСТИКА: Проверок пампа: {stats['pump_checks']}, Пампов найдено: {stats['pumps_found']}, Ликвидаций проверено: {stats['liquidations_checked']}, Сигналов: {stats['signals_sent']}", "HEARTBEAT")
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -160,74 +159,69 @@ def send_telegram_notification(chat_id, message, symbol):
             log(f"Уведомление отправлено в Telegram для {symbol}", "SUCCESS")
             stats['signals_sent'] += 1
             return True
-        else:
-            log(f"Ошибка Telegram: {response.status_code}", "ERROR")
     except Exception as e:
         log(f"Ошибка отправки: {e}", "ERROR")
     return False
 
 
-# ==================== LONG/SHORT RATIO (Binance) ====================
-def fetch_binance_long_short_ratio(symbol):
-    try:
-        current_time = time.time()
-        clean_symbol = symbol.replace('USDT', '').replace('1000', '')
-        
-        if clean_symbol in long_short_cache:
-            cache_time, cached_ratio, cached_long, cached_short = long_short_cache[clean_symbol]
-            if current_time - cache_time < LONG_SHORT_CACHE_TIME:
-                return cached_ratio, cached_long, cached_short
-        
-        url = "https://fapi.binance.com/futures/data/topLongShortAccountRatio"
-        params = {
-            "symbol": clean_symbol,
-            "period": "5m",
-            "limit": 1
-        }
-        
-        response = make_request_with_retry(url, params)
-        if response and response.status_code == 200:
-            data = response.json()
-            if data and len(data) > 0:
-                ratio = float(data[0].get('longShortRatio', 1.0))
-                long_account = float(data[0].get('longAccount', 50.0))
-                short_account = float(data[0].get('shortAccount', 50.0))
-                
-                long_short_cache[clean_symbol] = (current_time, ratio, long_account, short_account)
-                log(f"Long/Short {symbol}: {long_account:.0f}%/{short_account:.0f}% (ratio={ratio:.2f})")
-                return ratio, long_account, short_account
-    except Exception as e:
-        log(f"Ошибка Long/Short для {symbol}: {e}", "ERROR")
+# ==================== ПРОВЕРКА ПАМПА (ФОНОВЫЙ ПОТОК) ====================
+def check_all_pumps():
+    """Фоновый поток: каждые 30 секунд проверяет все монеты на памп"""
+    log("Запущен фоновый поиск пампа...", "SUCCESS")
     
-    return None, None, None
-
-
-# ==================== ПРОВЕРКА ПАМПА ====================
-def check_pump(symbol, current_price):
-    try:
-        stats['pump_checks'] += 1
-        
-        url = "https://api.binance.com/api/v3/klines"
-        params = {'symbol': symbol, 'interval': '5m', 'limit': 2}
-        response = make_request_with_retry(url, params)
-        
-        if response:
-            data = response.json()
-            if data and len(data) >= 2:
-                price_5min_ago = float(data[0][4])
-                pump_pct = ((current_price - price_5min_ago) / price_5min_ago) * 100
-                log(f"Памп {symbol}: +{pump_pct:.2f}% (нужно {PUMP_THRESHOLD}%)")
+    while True:
+        try:
+            # Получаем список всех USDT пар
+            url = "https://api.binance.com/api/v3/ticker/24hr"
+            response = make_request_with_retry(url)
+            
+            if response:
+                data = response.json()
+                current_time = time.time()
                 
-                if pump_pct >= PUMP_THRESHOLD:
-                    stats['pump_found'] += 1
-                    log(f"✅ Памп подтверждён для {symbol}: +{pump_pct:.2f}%", "SUCCESS")
-                    return True, pump_pct
-    except Exception as e:
-        log(f"Ошибка проверки пампа {symbol}: {e}", "ERROR")
-    
-    return False, 0
+                for item in data:
+                    symbol = item.get('symbol', '')
+                    if not symbol.endswith('USDT'):
+                        continue
+                    
+                    # Проверяем памп за 5 минут
+                    price_change_5m = float(item.get('priceChangePercent', 0))
+                    
+                    # Для более точной проверки используем klines
+                    try:
+                        klines_url = "https://api.binance.com/api/v3/klines"
+                        params = {'symbol': symbol, 'interval': '5m', 'limit': 2}
+                        klines_response = make_request_with_retry(klines_url, params)
+                        
+                        if klines_response:
+                            klines_data = klines_response.json()
+                            if klines_data and len(klines_data) >= 2:
+                                price_5min_ago = float(klines_data[0][4])
+                                current_price = float(klines_data[1][4])
+                                pump_pct = ((current_price - price_5min_ago) / price_5min_ago) * 100
+                                
+                                if pump_pct >= PUMP_THRESHOLD:
+                                    # Нашли памп!
+                                    if symbol not in pump_candidates or current_time - pump_candidates.get(symbol, {}).get('time', 0) > 300:
+                                        pump_candidates[symbol] = {
+                                            'pump_pct': pump_pct,
+                                            'price': current_price,
+                                            'time': current_time
+                                        }
+                                        stats['pumps_found'] += 1
+                                        log(f"Найден памп! {symbol}: +{pump_pct:.2f}% за 5 минут", "PUMP")
+                    except Exception as e:
+                        continue
+                
+                stats['pump_checks'] += 1
+                
+        except Exception as e:
+            log(f"Ошибка поиска пампа: {e}", "ERROR")
+        
+        time.sleep(PUMP_CHECK_INTERVAL)
 
 
+# ==================== ПОЛУЧЕНИЕ ЦЕНЫ ====================
 def fetch_current_price(symbol):
     try:
         url = "https://api.binance.com/api/v3/ticker/price"
@@ -242,18 +236,16 @@ def fetch_current_price(symbol):
 
 
 # ==================== РАСЧЁТ ЦЕЛЕЙ ====================
-def calculate_adaptive_targets(pump_pct, liquidation_value, ls_ratio, current_price):
+def calculate_targets(pump_pct, liquidation_value, current_price):
+    """Адаптивные TP/SL"""
     pump_factor = min(1.5, pump_pct / 2.0)
-    liq_factor = min(1.5, liquidation_value / 1000)  # Адаптируем под порог $1000
-    ls_factor = min(1.5, 1.0 + (ls_ratio - 1.0) * 0.5) if ls_ratio else 1.0
+    liq_factor = min(1.5, liquidation_value / 1000)
     
-    total_factor = pump_factor * liq_factor * ls_factor
+    total_factor = pump_factor * liq_factor
     
     tp1_pct = max(MIN_TP, min(MAX_TP * 0.8, 0.8 * total_factor))
     tp2_pct = max(tp1_pct + 0.3, min(MAX_TP, 1.2 * total_factor))
     sl_pct = max(MIN_SL, min(MAX_SL, 0.5 + (pump_pct / 10)))
-    
-    log(f"Цели: TP1={tp1_pct:.2f}%, TP2={tp2_pct:.2f}%, SL={sl_pct:.2f}%")
     
     return {
         'tp1_pct': round(tp1_pct, 2),
@@ -271,8 +263,6 @@ def on_websocket_message(ws, message):
         data = json.loads(message)
         
         if 'e' in data and data['e'] == 'forceOrder':
-            stats['total_liquidations'] += 1
-            
             liq = data['o']
             symbol = liq.get('s', 'UNKNOWN')
             side = liq.get('S')
@@ -280,76 +270,71 @@ def on_websocket_message(ws, message):
             price = float(liq.get('ap', 0))
             usd_value = quantity * price
             
-            log(f"Ликвидация: {symbol} | Сторона: {side} | Сумма: ${usd_value:,.0f}", "LIQUIDATION")
+            # Нас интересуют только SHORT ликвидации (BUY)
+            if side != 'BUY':
+                return
             
-            if side == 'BUY':
-                stats['short_liquidations'] += 1
-                
-                if usd_value < LIQUIDATION_THRESHOLD:
-                    log(f"Пропуск: сумма ${usd_value:,.0f} < порога ${LIQUIDATION_THRESHOLD}", "WARNING")
-                    return
-                
-                stats['short_above_threshold'] += 1
-                log(f"✅ Ликвидация SHORT на ${usd_value:,.0f} прошла фильтр!", "SUCCESS")
-                
-                current_time = time.time()
-                if symbol in last_alert_time and current_time - last_alert_time[symbol] < MIN_TIME_BETWEEN_SIGNALS:
-                    log(f"Пропуск: недавний сигнал для {symbol}", "WARNING")
-                    return
-                
-                current_price = fetch_current_price(symbol)
-                if current_price is None:
-                    log(f"Не удалось получить цену для {symbol}", "ERROR")
-                    return
-                
-                is_pump, pump_pct = check_pump(symbol, current_price)
-                if not is_pump:
-                    log(f"Памп не подтверждён для {symbol}", "WARNING")
-                    return
-                
-                if USE_LONG_SHORT_RATIO:
-                    stats['ls_checks'] += 1
-                    ls_ratio, long_pct, short_pct = fetch_binance_long_short_ratio(symbol)
-                    if ls_ratio is None or ls_ratio < LONG_SHORT_RATIO_THRESHOLD:
-                        log(f"Long/Short не пройден: {ls_ratio:.2f} < {LONG_SHORT_RATIO_THRESHOLD}", "WARNING")
-                        return
-                    stats['ls_passed'] += 1
-                    log(f"✅ Long/Short пройден: {long_pct:.0f}%/{short_pct:.0f}%", "SUCCESS")
-                else:
-                    ls_ratio, long_pct, short_pct = 1.5, 60, 40
-                
-                log(f"🎯 ВСЕ УСЛОВИЯ ВЫПОЛНЕНЫ! Отправляем сигнал для {symbol}", "SIGNAL")
-                
-                last_alert_time[symbol] = current_time
-                targets = calculate_adaptive_targets(pump_pct, usd_value, ls_ratio, current_price)
-                
-                volume_ratio = usd_value / LIQUIDATION_THRESHOLD
-                if volume_ratio >= 5:
-                    strength = "🔴🔴🔴 ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
-                elif volume_ratio >= 3:
-                    strength = "🔴🔴 ОЧЕНЬ СИЛЬНЫЙ"
-                elif volume_ratio >= 1.5:
-                    strength = "🔴 СИЛЬНЫЙ"
-                else:
-                    strength = "🟠 СРЕДНИЙ"
-                
-                msg = (
-                    f"{strength}\n\n"
-                    f"Монета: <code>{symbol}</code>\n"
-                    f"💰 Цена: {current_price:.8f}\n\n"
-                    f"📊 <b>Сигнал:</b>\n"
-                    f"• Памп за 5 мин: +{pump_pct:.2f}%\n"
-                    f"• Ликвидация SHORT: ${usd_value:,.0f}\n"
-                    f"• Long/Short: {long_pct:.0f}% / {short_pct:.0f}% (лонгов больше в {ls_ratio:.2f}x)\n\n"
-                    f"🎯 <b>Цели для шорта:</b>\n"
-                    f"• TP1 (-{targets['tp1_pct']}%): {targets['tp1_price']:.8f}\n"
-                    f"• TP2 (-{targets['tp2_pct']}%): {targets['tp2_price']:.8f}\n\n"
-                    f"⛔ Стоп-лосс (+{targets['sl_pct']}%): {targets['sl_price']:.8f}"
-                )
-                
-                for chat_id in list(users.keys()):
-                    if users[chat_id]['active']:
-                        send_telegram_notification(chat_id, msg, symbol)
+            log(f"Ликвидация SHORT: {symbol} | Сумма: ${usd_value:,.0f}", "LIQUIDATION")
+            
+            # Проверяем сумму
+            if usd_value < LIQUIDATION_THRESHOLD:
+                log(f"Пропуск: сумма ${usd_value:,.0f} < порога ${LIQUIDATION_THRESHOLD}", "WARNING")
+                return
+            
+            stats['liquidations_checked'] += 1
+            
+            # Проверяем был ли памп для этой монеты
+            current_time = time.time()
+            
+            if symbol not in pump_candidates:
+                log(f"Нет активного пампа для {symbol}", "WARNING")
+                return
+            
+            pump_info = pump_candidates[symbol]
+            
+            # Памп должен быть не старше 2 минут
+            if current_time - pump_info['time'] > 120:
+                log(f"Памп для {symbol} устарел (более 2 минут назад)", "WARNING")
+                return
+            
+            # Проверяем не было ли недавнего сигнала
+            if symbol in last_alert_time and current_time - last_alert_time[symbol] < MIN_TIME_BETWEEN_SIGNALS:
+                log(f"Недавний сигнал для {symbol}, пропускаем", "WARNING")
+                return
+            
+            # ВСЕ УСЛОВИЯ ВЫПОЛНЕНЫ!
+            log(f"🎯 ПАМП + ЛИКВИДАЦИЯ! Отправляем сигнал для {symbol}", "SIGNAL")
+            
+            last_alert_time[symbol] = current_time
+            targets = calculate_targets(pump_info['pump_pct'], usd_value, pump_info['price'])
+            
+            # Сила сигнала
+            volume_ratio = usd_value / LIQUIDATION_THRESHOLD
+            if volume_ratio >= 5:
+                strength = "🔴🔴🔴 ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
+            elif volume_ratio >= 3:
+                strength = "🔴🔴 ОЧЕНЬ СИЛЬНЫЙ"
+            elif volume_ratio >= 1.5:
+                strength = "🔴 СИЛЬНЫЙ"
+            else:
+                strength = "🟠 СРЕДНИЙ"
+            
+            msg = (
+                f"{strength}\n\n"
+                f"Монета: <code>{symbol}</code>\n"
+                f"💰 Цена: {pump_info['price']:.8f}\n\n"
+                f"📊 <b>Сигнал:</b>\n"
+                f"• Памп за 5 мин: +{pump_info['pump_pct']:.2f}%\n"
+                f"• Ликвидация SHORT: ${usd_value:,.0f}\n\n"
+                f"🎯 <b>Цели для шорта:</b>\n"
+                f"• TP1 (-{targets['tp1_pct']}%): {targets['tp1_price']:.8f}\n"
+                f"• TP2 (-{targets['tp2_pct']}%): {targets['tp2_price']:.8f}\n\n"
+                f"⛔ Стоп-лосс (+{targets['sl_pct']}%): {targets['sl_price']:.8f}"
+            )
+            
+            for chat_id in list(users.keys()):
+                if users[chat_id]['active']:
+                    send_telegram_notification(chat_id, msg, symbol)
                     
     except Exception as e:
         log(f"Ошибка обработки: {e}", "ERROR")
@@ -373,11 +358,11 @@ def on_websocket_open(ws):
 
 def send_startup_message():
     msg = (
-        "🔍 <b>Скринер «Памп + Ликвидации + Дисбаланс» запущен!</b>\n\n"
-        f"📊 <b>ТЕКУЩИЕ НАСТРОЙКИ:</b>\n"
-        f"• Памп от {PUMP_THRESHOLD}% за 5 минут\n"
-        f"• Ликвидация SHORT от ${LIQUIDATION_THRESHOLD:,}\n"
-        f"• Long/Short фильтр: {'ВКЛЮЧЕН' if USE_LONG_SHORT_RATIO else 'ВЫКЛЮЧЕН'}\n\n"
+        "🔍 <b>Скринер «Памп → Ликвидации» запущен!</b>\n\n"
+        f"📊 <b>НОВАЯ ЛОГИКА:</b>\n"
+        f"1️⃣ Сначала ищем памп от {PUMP_THRESHOLD}% за 5 минут\n"
+        f"2️⃣ Потом ждём ликвидацию SHORT от ${LIQUIDATION_THRESHOLD:,}\n"
+        f"3️⃣ Совпадение → СИГНАЛ НА ШОРТ!\n\n"
         f"🎯 Шорт 0.6-2.5%"
     )
     for chat_id in list(users.keys()):
@@ -390,6 +375,8 @@ def heartbeat():
     while True:
         time.sleep(30)
         log_stats()
+        if pump_candidates:
+            log(f"Активных пампов в памяти: {len(pump_candidates)}", "INFO")
 
 
 def connect_websocket():
@@ -444,7 +431,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': f"✅ Вы подписались на сигналы!\n\n📊 ТЕКУЩИЕ НАСТРОЙКИ:\n• Памп от {PUMP_THRESHOLD}% за 5 мин\n• Ликвидация SHORT от ${LIQUIDATION_THRESHOLD:,}\n\n🎯 Шорт 0.6-2.5%",
+                                'text': f"✅ Вы подписались на сигналы!\n\n📊 НОВАЯ ЛОГИКА:\n1️⃣ Памп от {PUMP_THRESHOLD}% за 5 мин\n2️⃣ Ликвидация SHORT от ${LIQUIDATION_THRESHOLD:,}\n\n🎯 Шорт 0.6-2.5%",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -457,14 +444,11 @@ def handle_telegram_updates():
                     elif text == '/stats':
                         msg = (
                             f"📊 <b>СТАТИСТИКА БОТА</b>\n\n"
-                            f"• Ликвидаций всего: {stats['total_liquidations']}\n"
-                            f"• SHORT ликвидаций: {stats['short_liquidations']}\n"
-                            f"• Выше ${LIQUIDATION_THRESHOLD}: {stats['short_above_threshold']}\n"
                             f"• Проверок пампа: {stats['pump_checks']}\n"
-                            f"• Пампов найдено: {stats['pump_found']}\n"
-                            f"• Проверок Long/Short: {stats['ls_checks']}\n"
-                            f"• Long/Short пройдено: {stats['ls_passed']}\n"
+                            f"• Пампов найдено: {stats['pumps_found']}\n"
+                            f"• Ликвидаций проверено: {stats['liquidations_checked']}\n"
                             f"• Сигналов отправлено: {stats['signals_sent']}\n"
+                            f"• Активных пампов: {len(pump_candidates)}"
                         )
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}
@@ -500,10 +484,9 @@ def send_shutdown_message():
 # ==================== MAIN ====================
 def main():
     print("=" * 60)
-    print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ + ДИСБАЛАНС»")
-    print(f"Порог пампа: {PUMP_THRESHOLD}% за 5 минут")
+    print("СКРИНЕР «ПАМП → ЛИКВИДАЦИИ»")
+    print(f"Логика: Памп {PUMP_THRESHOLD}% → Ждём ликвидацию → ШОРТ")
     print(f"Порог ликвидации: ${LIQUIDATION_THRESHOLD:,}")
-    print(f"Long/Short фильтр: {'ВКЛЮЧЕН' if USE_LONG_SHORT_RATIO else 'ВЫКЛЮЧЕН'}")
     print("=" * 60)
 
     atexit.register(send_shutdown_message)
@@ -513,13 +496,18 @@ def main():
     update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     update_thread.start()
 
-    # Запускаем heartbeat для статистики
+    # Запускаем фоновый поиск пампа
+    log("Запуск фонового поиска пампа...")
+    pump_thread = threading.Thread(target=check_all_pumps, daemon=True)
+    pump_thread.start()
+
+    # Запускаем heartbeat
     heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
     heartbeat_thread.start()
 
     time.sleep(2)
 
-    # Запускаем WebSocket
+    # Запускаем WebSocket для ликвидаций
     connect_websocket()
 
 
