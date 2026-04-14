@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 
 # ========== НАСТРОЙКИ СКРИНЕРА ==========
 PUMP_THRESHOLD = 2.0               # Памп от 2% за 5 минут
-LIQUIDATION_THRESHOLD = 1000      # Минимальная сумма ликвидации $50k
+LIQUIDATION_THRESHOLD = 1000       # Минимальная сумма ликвидации $1000
 
 # ========== НАСТРОЙКИ LONG/SHORT RATIO ==========
 USE_LONG_SHORT_RATIO = True        # Включить Long/Short фильтр
@@ -44,10 +44,46 @@ users = {
     }
 }
 
-# Кеши
+# Кеши и статистика
 long_short_cache = {}
 price_history_cache = {}
 last_alert_time = {}
+
+# Статистика для логов
+stats = {
+    'total_liquidations': 0,
+    'short_liquidations': 0,
+    'short_above_threshold': 0,
+    'pump_checks': 0,
+    'pump_found': 0,
+    'ls_checks': 0,
+    'ls_passed': 0,
+    'signals_sent': 0,
+    'last_heartbeat': time.time()
+}
+
+
+# ==================== ФУНКЦИЯ ЛОГИРОВАНИЯ ====================
+def log(message, level="INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if level == "ERROR":
+        print(f"\033[91m[{timestamp}] ❌ {message}\033[0m")
+    elif level == "SUCCESS":
+        print(f"\033[92m[{timestamp}] ✅ {message}\033[0m")
+    elif level == "WARNING":
+        print(f"\033[93m[{timestamp}] ⚠️ {message}\033[0m")
+    elif level == "LIQUIDATION":
+        print(f"\033[94m[{timestamp}] 💀 {message}\033[0m")
+    elif level == "SIGNAL":
+        print(f"\033[95m[{timestamp}] 🔔 {message}\033[0m")
+    elif level == "HEARTBEAT":
+        print(f"\033[96m[{timestamp}] 💓 {message}\033[0m")
+    else:
+        print(f"[{timestamp}] 📢 {message}")
+
+
+def log_stats():
+    log(f"СТАТИСТИКА: Ликвидаций всего: {stats['total_liquidations']}, SHORT: {stats['short_liquidations']}, Выше ${LIQUIDATION_THRESHOLD}: {stats['short_above_threshold']}, Пампов найдено: {stats['pump_found']}/{stats['pump_checks']}, Long/Short пройдено: {stats['ls_passed']}/{stats['ls_checks']}, Сигналов: {stats['signals_sent']}", "HEARTBEAT")
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -58,7 +94,7 @@ def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retri
             if response.status_code == 200:
                 return response
         except Exception as e:
-            print(f"Попытка {attempt + 1}: {e}")
+            log(f"Попытка {attempt + 1}: {e}", "WARNING")
 
         if attempt < max_retries - 1:
             time.sleep(RETRY_DELAY * (attempt + 1))
@@ -89,6 +125,7 @@ def can_send_alert(chat_id, symbol):
     reset_daily_counters(chat_id)
     count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
     if count >= MAX_ALERTS_PER_DAY:
+        log(f"Лимит для {symbol}: {count}/{MAX_ALERTS_PER_DAY}", "WARNING")
         return False
     users[chat_id]['daily_alerts']['counts'][symbol] = count + 1
     return True
@@ -119,20 +156,23 @@ def send_telegram_notification(chat_id, message, symbol):
     }
     try:
         response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        return True
+        if response.status_code == 200:
+            log(f"Уведомление отправлено в Telegram для {symbol}", "SUCCESS")
+            stats['signals_sent'] += 1
+            return True
+        else:
+            log(f"Ошибка Telegram: {response.status_code}", "ERROR")
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
-        return False
+        log(f"Ошибка отправки: {e}", "ERROR")
+    return False
 
 
 # ==================== LONG/SHORT RATIO (Binance) ====================
 def fetch_binance_long_short_ratio(symbol):
-    """Получает Long/Short Ratio с Binance (бесплатно)"""
     try:
         current_time = time.time()
         clean_symbol = symbol.replace('USDT', '').replace('1000', '')
         
-        # Проверяем кеш
         if clean_symbol in long_short_cache:
             cache_time, cached_ratio, cached_long, cached_short = long_short_cache[clean_symbol]
             if current_time - cache_time < LONG_SHORT_CACHE_TIME:
@@ -154,17 +194,19 @@ def fetch_binance_long_short_ratio(symbol):
                 short_account = float(data[0].get('shortAccount', 50.0))
                 
                 long_short_cache[clean_symbol] = (current_time, ratio, long_account, short_account)
+                log(f"Long/Short {symbol}: {long_account:.0f}%/{short_account:.0f}% (ratio={ratio:.2f})")
                 return ratio, long_account, short_account
     except Exception as e:
-        print(f"Ошибка Long/Short для {symbol}: {e}")
+        log(f"Ошибка Long/Short для {symbol}: {e}", "ERROR")
     
     return None, None, None
 
 
 # ==================== ПРОВЕРКА ПАМПА ====================
 def check_pump(symbol, current_price):
-    """Проверяет памп за 5 минут"""
     try:
+        stats['pump_checks'] += 1
+        
         url = "https://api.binance.com/api/v3/klines"
         params = {'symbol': symbol, 'interval': '5m', 'limit': 2}
         response = make_request_with_retry(url, params)
@@ -174,15 +216,19 @@ def check_pump(symbol, current_price):
             if data and len(data) >= 2:
                 price_5min_ago = float(data[0][4])
                 pump_pct = ((current_price - price_5min_ago) / price_5min_ago) * 100
-                return pump_pct >= PUMP_THRESHOLD, pump_pct
+                log(f"Памп {symbol}: +{pump_pct:.2f}% (нужно {PUMP_THRESHOLD}%)")
+                
+                if pump_pct >= PUMP_THRESHOLD:
+                    stats['pump_found'] += 1
+                    log(f"✅ Памп подтверждён для {symbol}: +{pump_pct:.2f}%", "SUCCESS")
+                    return True, pump_pct
     except Exception as e:
-        print(f"Ошибка проверки пампа {symbol}: {e}")
+        log(f"Ошибка проверки пампа {symbol}: {e}", "ERROR")
     
     return False, 0
 
 
 def fetch_current_price(symbol):
-    """Получает текущую цену"""
     try:
         url = "https://api.binance.com/api/v3/ticker/price"
         params = {"symbol": symbol}
@@ -191,16 +237,14 @@ def fetch_current_price(symbol):
             data = response.json()
             return float(data['price'])
     except Exception as e:
-        print(f"Ошибка получения цены {symbol}: {e}")
+        log(f"Ошибка получения цены {symbol}: {e}", "ERROR")
     return None
 
 
 # ==================== РАСЧЁТ ЦЕЛЕЙ ====================
 def calculate_adaptive_targets(pump_pct, liquidation_value, ls_ratio, current_price):
-    """Адаптивные TP/SL"""
-    # Базовые множители
     pump_factor = min(1.5, pump_pct / 2.0)
-    liq_factor = min(1.5, liquidation_value / 50000)
+    liq_factor = min(1.5, liquidation_value / 1000)  # Адаптируем под порог $1000
     ls_factor = min(1.5, 1.0 + (ls_ratio - 1.0) * 0.5) if ls_ratio else 1.0
     
     total_factor = pump_factor * liq_factor * ls_factor
@@ -208,6 +252,8 @@ def calculate_adaptive_targets(pump_pct, liquidation_value, ls_ratio, current_pr
     tp1_pct = max(MIN_TP, min(MAX_TP * 0.8, 0.8 * total_factor))
     tp2_pct = max(tp1_pct + 0.3, min(MAX_TP, 1.2 * total_factor))
     sl_pct = max(MIN_SL, min(MAX_SL, 0.5 + (pump_pct / 10)))
+    
+    log(f"Цели: TP1={tp1_pct:.2f}%, TP2={tp2_pct:.2f}%, SL={sl_pct:.2f}%")
     
     return {
         'tp1_pct': round(tp1_pct, 2),
@@ -225,6 +271,8 @@ def on_websocket_message(ws, message):
         data = json.loads(message)
         
         if 'e' in data and data['e'] == 'forceOrder':
+            stats['total_liquidations'] += 1
+            
             liq = data['o']
             symbol = liq.get('s', 'UNKNOWN')
             side = liq.get('S')
@@ -232,98 +280,116 @@ def on_websocket_message(ws, message):
             price = float(liq.get('ap', 0))
             usd_value = quantity * price
             
-            # Только SHORT ликвидации (цена растёт)
-            if side != 'BUY' or usd_value < LIQUIDATION_THRESHOLD:
-                return
+            log(f"Ликвидация: {symbol} | Сторона: {side} | Сумма: ${usd_value:,.0f}", "LIQUIDATION")
             
-            # Проверяем не было ли недавнего сигнала
-            current_time = time.time()
-            if symbol in last_alert_time and current_time - last_alert_time[symbol] < MIN_TIME_BETWEEN_SIGNALS:
-                return
-            
-            # Получаем текущую цену
-            current_price = fetch_current_price(symbol)
-            if current_price is None:
-                return
-            
-            # Проверяем памп
-            is_pump, pump_pct = check_pump(symbol, current_price)
-            if not is_pump:
-                return
-            
-            # Проверяем Long/Short Ratio
-            if USE_LONG_SHORT_RATIO:
-                ls_ratio, long_pct, short_pct = fetch_binance_long_short_ratio(symbol)
-                if ls_ratio is None or ls_ratio < LONG_SHORT_RATIO_THRESHOLD:
+            if side == 'BUY':
+                stats['short_liquidations'] += 1
+                
+                if usd_value < LIQUIDATION_THRESHOLD:
+                    log(f"Пропуск: сумма ${usd_value:,.0f} < порога ${LIQUIDATION_THRESHOLD}", "WARNING")
                     return
-            else:
-                ls_ratio, long_pct, short_pct = 1.5, 60, 40
-            
-            # Все условия выполнены → сигнал
-            last_alert_time[symbol] = current_time
-            targets = calculate_adaptive_targets(pump_pct, usd_value, ls_ratio, current_price)
-            
-            # Сила сигнала
-            volume_ratio = usd_value / LIQUIDATION_THRESHOLD
-            if volume_ratio >= 5:
-                strength = "🔴🔴🔴 ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
-            elif volume_ratio >= 3:
-                strength = "🔴🔴 ОЧЕНЬ СИЛЬНЫЙ"
-            elif volume_ratio >= 1.5:
-                strength = "🔴 СИЛЬНЫЙ"
-            else:
-                strength = "🟠 СРЕДНИЙ"
-            
-            msg = (
-                f"{strength}\n\n"
-                f"Монета: <code>{symbol}</code>\n"
-                f"💰 Цена: {current_price:.8f}\n\n"
-                f"📊 <b>Сигнал:</b>\n"
-                f"• Памп за 5 мин: +{pump_pct:.2f}%\n"
-                f"• Ликвидация SHORT: ${usd_value:,.0f}\n"
-                f"• Long/Short: {long_pct:.0f}% / {short_pct:.0f}% (лонгов больше в {ls_ratio:.2f}x)\n\n"
-                f"🎯 <b>Цели для шорта:</b>\n"
-                f"• TP1 (-{targets['tp1_pct']}%): {targets['tp1_price']:.8f}\n"
-                f"• TP2 (-{targets['tp2_pct']}%): {targets['tp2_price']:.8f}\n\n"
-                f"⛔ Стоп-лосс (+{targets['sl_pct']}%): {targets['sl_price']:.8f}"
-            )
-            
-            for chat_id in list(users.keys()):
-                if users[chat_id]['active']:
-                    send_telegram_notification(chat_id, msg, symbol)
+                
+                stats['short_above_threshold'] += 1
+                log(f"✅ Ликвидация SHORT на ${usd_value:,.0f} прошла фильтр!", "SUCCESS")
+                
+                current_time = time.time()
+                if symbol in last_alert_time and current_time - last_alert_time[symbol] < MIN_TIME_BETWEEN_SIGNALS:
+                    log(f"Пропуск: недавний сигнал для {symbol}", "WARNING")
+                    return
+                
+                current_price = fetch_current_price(symbol)
+                if current_price is None:
+                    log(f"Не удалось получить цену для {symbol}", "ERROR")
+                    return
+                
+                is_pump, pump_pct = check_pump(symbol, current_price)
+                if not is_pump:
+                    log(f"Памп не подтверждён для {symbol}", "WARNING")
+                    return
+                
+                if USE_LONG_SHORT_RATIO:
+                    stats['ls_checks'] += 1
+                    ls_ratio, long_pct, short_pct = fetch_binance_long_short_ratio(symbol)
+                    if ls_ratio is None or ls_ratio < LONG_SHORT_RATIO_THRESHOLD:
+                        log(f"Long/Short не пройден: {ls_ratio:.2f} < {LONG_SHORT_RATIO_THRESHOLD}", "WARNING")
+                        return
+                    stats['ls_passed'] += 1
+                    log(f"✅ Long/Short пройден: {long_pct:.0f}%/{short_pct:.0f}%", "SUCCESS")
+                else:
+                    ls_ratio, long_pct, short_pct = 1.5, 60, 40
+                
+                log(f"🎯 ВСЕ УСЛОВИЯ ВЫПОЛНЕНЫ! Отправляем сигнал для {symbol}", "SIGNAL")
+                
+                last_alert_time[symbol] = current_time
+                targets = calculate_adaptive_targets(pump_pct, usd_value, ls_ratio, current_price)
+                
+                volume_ratio = usd_value / LIQUIDATION_THRESHOLD
+                if volume_ratio >= 5:
+                    strength = "🔴🔴🔴 ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
+                elif volume_ratio >= 3:
+                    strength = "🔴🔴 ОЧЕНЬ СИЛЬНЫЙ"
+                elif volume_ratio >= 1.5:
+                    strength = "🔴 СИЛЬНЫЙ"
+                else:
+                    strength = "🟠 СРЕДНИЙ"
+                
+                msg = (
+                    f"{strength}\n\n"
+                    f"Монета: <code>{symbol}</code>\n"
+                    f"💰 Цена: {current_price:.8f}\n\n"
+                    f"📊 <b>Сигнал:</b>\n"
+                    f"• Памп за 5 мин: +{pump_pct:.2f}%\n"
+                    f"• Ликвидация SHORT: ${usd_value:,.0f}\n"
+                    f"• Long/Short: {long_pct:.0f}% / {short_pct:.0f}% (лонгов больше в {ls_ratio:.2f}x)\n\n"
+                    f"🎯 <b>Цели для шорта:</b>\n"
+                    f"• TP1 (-{targets['tp1_pct']}%): {targets['tp1_price']:.8f}\n"
+                    f"• TP2 (-{targets['tp2_pct']}%): {targets['tp2_price']:.8f}\n\n"
+                    f"⛔ Стоп-лосс (+{targets['sl_pct']}%): {targets['sl_price']:.8f}"
+                )
+                
+                for chat_id in list(users.keys()):
+                    if users[chat_id]['active']:
+                        send_telegram_notification(chat_id, msg, symbol)
                     
     except Exception as e:
-        print(f"Ошибка обработки: {e}")
+        log(f"Ошибка обработки: {e}", "ERROR")
 
 
 def on_websocket_error(ws, error):
-    print(f"Ошибка WebSocket: {error}")
+    log(f"Ошибка WebSocket: {error}", "ERROR")
     time.sleep(5)
 
 
 def on_websocket_close(ws, close_status_code, close_msg):
-    print(f"Соединение закрыто. Переподключение...")
+    log(f"Соединение закрыто. Переподключение...", "WARNING")
     time.sleep(2)
     connect_websocket()
 
 
 def on_websocket_open(ws):
-    print("✅ WebSocket подключен к Binance")
+    log("WebSocket подключен к Binance! Ожидание ликвидаций...", "SUCCESS")
     send_startup_message()
 
 
 def send_startup_message():
     msg = (
         "🔍 <b>Скринер «Памп + Ликвидации + Дисбаланс» запущен!</b>\n\n"
-        "📊 <b>Условия:</b>\n"
-        "• Памп от 2% за 5 минут\n"
-        "• Ликвидация SHORT от $50,000\n"
-        "• Лонгов > шортов в 1.3x раза\n\n"
-        "🎯 Шорт 0.6-2.5%"
+        f"📊 <b>ТЕКУЩИЕ НАСТРОЙКИ:</b>\n"
+        f"• Памп от {PUMP_THRESHOLD}% за 5 минут\n"
+        f"• Ликвидация SHORT от ${LIQUIDATION_THRESHOLD:,}\n"
+        f"• Long/Short фильтр: {'ВКЛЮЧЕН' if USE_LONG_SHORT_RATIO else 'ВЫКЛЮЧЕН'}\n\n"
+        f"🎯 Шорт 0.6-2.5%"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
             send_telegram_notification(chat_id, msg, "SYSTEM")
+
+
+def heartbeat():
+    """Поток для вывода статистики каждые 30 секунд"""
+    while True:
+        time.sleep(30)
+        log_stats()
 
 
 def connect_websocket():
@@ -337,7 +403,7 @@ def connect_websocket():
         )
         ws.run_forever()
     except Exception as e:
-        print(f"Ошибка подключения: {e}")
+        log(f"Ошибка подключения: {e}", "ERROR")
         time.sleep(5)
         connect_websocket()
 
@@ -373,12 +439,12 @@ def handle_telegram_updates():
                                     'counts': {}
                                 }
                             }
-                            print(f"✅ Новый пользователь: {chat_id}")
+                            log(f"Новый пользователь: {chat_id}", "SUCCESS")
 
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': "✅ Вы подписались на сигналы!\n\n📊 Условия:\n• Памп от 2% за 5 мин\n• Ликвидация SHORT от $50k\n• Лонгов > шортов в 1.3x\n\n🎯 Шорт 0.6-2.5%",
+                                'text': f"✅ Вы подписались на сигналы!\n\n📊 ТЕКУЩИЕ НАСТРОЙКИ:\n• Памп от {PUMP_THRESHOLD}% за 5 мин\n• Ликвидация SHORT от ${LIQUIDATION_THRESHOLD:,}\n\n🎯 Шорт 0.6-2.5%",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -386,20 +452,36 @@ def handle_telegram_updates():
                     elif text == '/stop':
                         if chat_id in users:
                             del users[chat_id]
-                            print(f"❌ Пользователь {chat_id} удален")
+                            log(f"Пользователь {chat_id} удален", "WARNING")
+
+                    elif text == '/stats':
+                        msg = (
+                            f"📊 <b>СТАТИСТИКА БОТА</b>\n\n"
+                            f"• Ликвидаций всего: {stats['total_liquidations']}\n"
+                            f"• SHORT ликвидаций: {stats['short_liquidations']}\n"
+                            f"• Выше ${LIQUIDATION_THRESHOLD}: {stats['short_above_threshold']}\n"
+                            f"• Проверок пампа: {stats['pump_checks']}\n"
+                            f"• Пампов найдено: {stats['pump_found']}\n"
+                            f"• Проверок Long/Short: {stats['ls_checks']}\n"
+                            f"• Long/Short пройдено: {stats['ls_passed']}\n"
+                            f"• Сигналов отправлено: {stats['signals_sent']}\n"
+                        )
+                        url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        payload = {'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}
+                        requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
 
                     elif text == '/help':
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Команды:</b>\n/start - подписаться\n/stop - отписаться\n/help - справка",
+                            'text': "🤖 <b>Команды:</b>\n/start - подписаться\n/stop - отписаться\n/stats - статистика\n/help - справка",
                             'parse_mode': 'HTML'
                         }
                         requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
 
             time.sleep(1)
         except Exception as e:
-            print(f"Ошибка Telegram: {e}")
+            log(f"Ошибка Telegram: {e}", "ERROR")
             time.sleep(5)
 
 
@@ -419,15 +501,21 @@ def send_shutdown_message():
 def main():
     print("=" * 60)
     print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ + ДИСБАЛАНС»")
-    print("WebSocket: Binance (один поток)")
-    print("REST API: Binance (памп + Long/Short)")
+    print(f"Порог пампа: {PUMP_THRESHOLD}% за 5 минут")
+    print(f"Порог ликвидации: ${LIQUIDATION_THRESHOLD:,}")
+    print(f"Long/Short фильтр: {'ВКЛЮЧЕН' if USE_LONG_SHORT_RATIO else 'ВЫКЛЮЧЕН'}")
     print("=" * 60)
 
     atexit.register(send_shutdown_message)
 
     # Запускаем обработчик Telegram
+    log("Запуск обработчика Telegram...")
     update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     update_thread.start()
+
+    # Запускаем heartbeat для статистики
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
 
     time.sleep(2)
 
