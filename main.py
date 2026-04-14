@@ -3,12 +3,22 @@ import json
 import time
 import requests
 from datetime import datetime
+import os  # Добавьте эту строку
+from dotenv import load_dotenv  # Установите: pip install python-dotenv
 
-# Настройки
-TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
-TELEGRAM_CHAT_ID = '5296533274'
+# Загружаем переменные из .env файла
+load_dotenv()
+
+# Настройки из переменных окружения
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 LIQUIDATION_THRESHOLD = 3000  # Минимальная сумма ликвидации в USD
 TEST_MODE = False
+
+# Проверка наличия переменных
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("ОШИБКА: Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
+    exit(1)
 
 # Топ-25 монет по рыночной капитализации
 TOP_25_COINS = {
