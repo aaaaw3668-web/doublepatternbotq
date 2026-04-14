@@ -13,10 +13,6 @@ TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 PUMP_THRESHOLD = 2.0               # Памп от 2% за 5 минут
 TIME_WINDOW = 60 * 5               # 5 минут для анализа пампа
 
-# ========== НАСТРОЙКИ LONG/SHORT RATIO ==========
-LONG_SHORT_RATIO_THRESHOLD = 1.3   # Лонгов в 1.3 раза больше (65% лонгов / 35% шортов)
-LONG_SHORT_CACHE_TIME = 300        # Кешировать данные на 5 минут (чтобы не спамить API)
-
 # ========== НАСТРОЙКИ ЛИКВИДАЦИЙ ==========
 MIN_LIQUIDATION_VOLUME = {
     'large': 500000,    # BTC/ETH: $500k+
@@ -54,7 +50,6 @@ users = {
 
 historical_prices = {}
 liquidation_data = {}
-long_short_cache = {}  # Кеш для Long/Short Ratio
 data_lock = threading.Lock()
 symbols_list = []
 websocket_connections = {}
@@ -163,64 +158,6 @@ def send_telegram_notification(chat_id, message, symbol, exchange):
         return False
 
 
-# ==================== LONG/SHORT RATIO (С КЕШИРОВАНИЕМ) ====================
-def fetch_long_short_ratio(symbol):
-    """
-    Получает Long/Short Ratio с Bybit с кешированием.
-    Данные обновляются раз в 5 минут, чтобы не превышать лимиты API.
-    """
-    try:
-        current_time = time.time()
-        clean_symbol = symbol.replace('USDT', '').replace('1000', '')
-        
-        # Проверяем кеш
-        if clean_symbol in long_short_cache:
-            cache_time, cached_ratio, cached_buy, cached_sell = long_short_cache[clean_symbol]
-            if current_time - cache_time < LONG_SHORT_CACHE_TIME:
-                return cached_ratio, cached_buy, cached_sell
-        
-        url = "https://api.bybit.com/v5/market/account-ratio"
-        params = {
-            "category": "linear",
-            "symbol": clean_symbol,
-            "period": "5min",
-            "limit": 1
-        }
-        
-        response = make_request_with_retry(url, params)
-        if response and response.status_code == 200:
-            data = response.json()
-            if data.get('retCode') == 0 and data.get('result', {}).get('list'):
-                item = data['result']['list'][0]
-                buy_ratio = float(item.get('buy_ratio', 0.5))
-                sell_ratio = float(item.get('sell_ratio', 0.5))
-                
-                if sell_ratio > 0:
-                    ratio = buy_ratio / sell_ratio
-                else:
-                    ratio = 1.0
-                
-                # Сохраняем в кеш
-                long_short_cache[clean_symbol] = (current_time, ratio, buy_ratio, sell_ratio)
-                
-                return ratio, buy_ratio, sell_ratio
-            else:
-                # Если ошибка API, возвращаем нейтральное значение и кешируем
-                long_short_cache[clean_symbol] = (current_time, 1.0, 0.5, 0.5)
-                return 1.0, 0.5, 0.5
-        else:
-            # Если запрос не удался, используем кеш или нейтральное значение
-            if clean_symbol in long_short_cache:
-                cache_time, cached_ratio, cached_buy, cached_sell = long_short_cache[clean_symbol]
-                return cached_ratio, cached_buy, cached_sell
-            return 1.0, 0.5, 0.5
-        
-    except Exception as e:
-        print(f"Ошибка Long/Short для {symbol}: {e}")
-    
-    return None, None, None
-
-
 # ==================== РАСЧЁТ АДАПТИВНЫХ ЦЕЛЕЙ ====================
 def calculate_volatility(prices):
     if len(prices) < 10:
@@ -241,7 +178,7 @@ def calculate_volatility(prices):
     return max(0.3, min(3.0, volatility_pct))
 
 
-def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, ls_ratio, current_price, symbol):
+def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, current_price, symbol):
     """Расчёт адаптивных TP и SL на основе всех факторов"""
     volatility = calculate_volatility(prices)
     category = get_asset_category(symbol)
@@ -256,9 +193,6 @@ def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, ls_rat
     liq_threshold = get_liquidation_threshold_volume(symbol)
     liq_factor = min(1.5, 1.0 + (liquidation_volume_usdt / liq_threshold) * 0.5)
     
-    # Фактор Long/Short Ratio (чем больше дисбаланс, тем сильнее сигнал)
-    ls_factor = min(1.5, 1.0 + (ls_ratio - 1.0) * 0.5)
-    
     # Фактор категории
     if category == 'large':
         category_factor = 0.7
@@ -268,11 +202,11 @@ def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, ls_rat
         category_factor = 1.3
     
     # Расчёт TP1
-    tp1_base = 0.8 * pump_factor * liq_factor * ls_factor * category_factor
+    tp1_base = 0.8 * pump_factor * liq_factor * category_factor
     tp1_pct = max(MIN_TP, min(MAX_TP * 0.8, tp1_base))
     
     # Расчёт TP2
-    tp2_base = 1.2 * pump_factor * liq_factor * ls_factor * category_factor
+    tp2_base = 1.2 * pump_factor * liq_factor * category_factor
     tp2_pct = max(tp1_pct + 0.3, min(MAX_TP, tp2_base))
     
     # Расчёт стоп-лосса
@@ -283,7 +217,6 @@ def calculate_adaptive_targets(prices, pump_pct, liquidation_volume_usdt, ls_rat
     success_prob = 50
     success_prob += min(20, pump_pct * 5)
     success_prob += min(25, (liquidation_volume_usdt / liq_threshold) * 15)
-    success_prob += min(15, (ls_ratio - 1.0) * 30)
     success_prob = min(95, success_prob)
     
     # Risk/Reward
@@ -456,29 +389,19 @@ def check_pump_and_liquidations(symbol, current_price):
         if total_volume_usdt < liq_threshold:
             return False, None
         
-        # 3. Получаем Long/Short Ratio (с кешированием)
-        ls_ratio, buy_ratio, sell_ratio = fetch_long_short_ratio(symbol)
+        # 3. Рассчитываем адаптивные цели
+        targets = calculate_adaptive_targets(prices, pump_pct, total_volume_usdt, current_price, symbol)
         
-        if ls_ratio is None:
-            return False, None
-        
-        if ls_ratio < LONG_SHORT_RATIO_THRESHOLD:
-            return False, None
-        
-        # 4. Рассчитываем адаптивные цели
-        targets = calculate_adaptive_targets(prices, pump_pct, total_volume_usdt, ls_ratio, current_price, symbol)
-        
-        # 5. Определяем силу сигнала
+        # 4. Определяем силу сигнала
         volume_ratio = total_volume_usdt / liq_threshold
-        ls_excess = ls_ratio - 1.0
         
-        if volume_ratio >= 5 and ls_excess >= 0.5:
+        if volume_ratio >= 5:
             strength_emoji = "🔴🔴🔴"
             strength_text = "ЭКСТРЕМАЛЬНО СИЛЬНЫЙ"
-        elif volume_ratio >= 3 or ls_excess >= 0.3:
+        elif volume_ratio >= 3:
             strength_emoji = "🔴🔴"
             strength_text = "ОЧЕНЬ СИЛЬНЫЙ"
-        elif volume_ratio >= 1.5 or ls_excess >= 0.15:
+        elif volume_ratio >= 1.5:
             strength_emoji = "🔴"
             strength_text = "СИЛЬНЫЙ"
         else:
@@ -489,9 +412,6 @@ def check_pump_and_liquidations(symbol, current_price):
             'pump_pct': pump_pct,
             'total_volume_usdt': total_volume_usdt,
             'liq_threshold': liq_threshold,
-            'ls_ratio': ls_ratio,
-            'buy_ratio': buy_ratio,
-            'sell_ratio': sell_ratio,
             'current_price': current_price,
             'strength_emoji': strength_emoji,
             'strength_text': strength_text,
@@ -509,7 +429,8 @@ def check_pump_and_liquidations(symbol, current_price):
 def monitor_pumps():
     global symbols_list
     
-    print("🚀 Запуск мониторинга памп + ликвидации + Long/Short...")
+    print("🚀 Запуск мониторинга памп + ликвидации...")
+    print("📊 Логика: Памп 2%+ за 5 минут + ликвидации шортов → Шорт")
     
     symbols_list = fetch_binance_symbols()
     if not symbols_list:
@@ -520,14 +441,12 @@ def monitor_pumps():
     print(f"Запуск WebSocket для {len(symbols_list)} символов...")
     for symbol in symbols_list:
         connect_liquidation_websocket(symbol)
-        time.sleep(0.05)  # Уменьшил задержку для быстрого запуска
+        time.sleep(0.05)
     
     print(f"Мониторинг {len(symbols_list)} символов")
     print(f"Пороги ликвидаций: BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}, "
           f"Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}, "
           f"Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}")
-    print(f"Long/Short порог: лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз")
-    print(f"Long/Short кеш: {LONG_SHORT_CACHE_TIME} секунд")
     
     last_alert_time = {}
     error_count = 0
@@ -565,18 +484,15 @@ def monitor_pumps():
                         
                         liq_volume_formatted = f"${details['total_volume_usdt']:,.0f}"
                         liq_threshold_formatted = f"${details['liq_threshold']:,.0f}"
-                        buy_pct = details['buy_ratio'] * 100
-                        sell_pct = details['sell_ratio'] * 100
                         
                         msg = (
-                            f"{details['strength_emoji']} <b>ПАМП + ЛИКВИДАЦИИ + ДИСБАЛАНС</b> {details['strength_emoji']}\n\n"
+                            f"{details['strength_emoji']} <b>ПАМП + ЛИКВИДАЦИИ ШОРТОВ</b> {details['strength_emoji']}\n\n"
                             f"Монета: <code>{symbol}</code> (Binance)\n"
                             f"{cat_emoji} Категория: {cat_text}\n"
                             f"💰 Цена: {current_price:.8f}\n\n"
                             f"📊 <b>Сигнал:</b>\n"
                             f"• Памп за 5 мин: +{details['pump_pct']:.2f}%\n"
                             f"• Ликвидации шортов: {liq_volume_formatted} (порог: {liq_threshold_formatted})\n"
-                            f"• Long/Short: {buy_pct:.0f}% / {sell_pct:.0f}% (лонгов больше в {details['ls_ratio']:.2f}x)\n"
                             f"• Качество: {details['strength_text']}\n\n"
                             f"📈 <b>Адаптивные цели:</b>\n"
                             f"• Волатильность: {t['volatility']}%\n"
@@ -589,8 +505,7 @@ def monitor_pumps():
                             f"• SL ({t['sl_pct']}%): {t['sl_price']:.8f}\n\n"
                             f"💡 <b>Логика:</b>\n"
                             f"Цена выросла на {details['pump_pct']:.1f}%, выбив шортов на {liq_volume_formatted}.\n"
-                            f"При этом {buy_pct:.0f}% трейдеров в лонгах. Умные деньги развернут их!\n"
-                            f"Готовьте шорт!"
+                            f"Умные деньги забрали ликвидность — готовьте шорт!"
                         )
                         
                         for chat_id in list(users.keys()):
@@ -602,7 +517,7 @@ def monitor_pumps():
                     error_count += 1
                     continue
             
-            # Логирование каждые 5 циклов (чтобы не заспамливать консоль)
+            # Логирование каждые 30 секунд
             if int(time.time()) % 30 == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Мониторинг активен...")
             
@@ -653,7 +568,7 @@ def handle_telegram_updates():
                             url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                             payload = {
                                 'chat_id': chat_id,
-                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации + Дисбаланс»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние: от $50,000\n• Мелкие: от $5,000\n\n3️⃣ <b>Long/Short дисбаланс</b>\n• Лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n\n📍 Биржи: Binance (цены) + Bybit (данные)",
+                                'text': f"✅ Вы подписались на сигналы «Памп + Ликвидации шортов»!\n\n📊 <b>Что отслеживается:</b>\n\n1️⃣ <b>Памп от {PUMP_THRESHOLD}% за 5 минут</b>\n\n2️⃣ <b>Ликвидации шортов ПО ОБЪЁМУ</b>\n• BTC/ETH: от $500,000\n• Средние: от $50,000\n• Мелкие: от $5,000\n\n🎯 <b>Адаптивные цели</b>\n• TP/SL под каждый актив\n\n📍 Биржа: Binance",
                                 'parse_mode': 'HTML'
                             }
                             requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -667,7 +582,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Памп + Ликвидации + Дисбаланс</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Логика:</b>\n1. Памп от 2% за 5 минут\n2. Ликвидации шортов на значительную сумму\n3. Лонгов больше чем шортов\n4. → Шорт\n\n📍 Биржи: Binance + Bybit",
+                            'text': "🤖 <b>Памп + Ликвидации шортов</b>\n\n/start - подписаться\n/stop - отписаться\n/help - справка\n\n📈 <b>Логика:</b>\n1. Памп от 2% за 5 минут\n2. Ликвидации шортов на значительную сумму\n3. → Шорт\n\n📍 Биржа: Binance",
                             'parse_mode': 'HTML'
                         }
                         requests.post(url_send, json=payload, timeout=REQUEST_TIMEOUT)
@@ -693,9 +608,8 @@ def send_shutdown_message():
 # ==================== MAIN ====================
 def main():
     print("=" * 60)
-    print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ + ДИСБАЛАНС»")
+    print("СКРИНЕР «ПАМП + ЛИКВИДАЦИИ ШОРТОВ»")
     print(f"Памп: от {PUMP_THRESHOLD}% за 5 минут")
-    print(f"Long/Short: лонгов больше в {LONG_SHORT_RATIO_THRESHOLD}x раз")
     print("Ликвидации: по объёму в USDT")
     print("=" * 60)
 
@@ -715,12 +629,11 @@ def main():
         f"• Ликвидации шортов на сумму от:\n"
         f"  - BTC/ETH: ${MIN_LIQUIDATION_VOLUME['large']:,}\n"
         f"  - Средние: ${MIN_LIQUIDATION_VOLUME['mid']:,}\n"
-        f"  - Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}\n"
-        f"• Лонгов > шортов в {LONG_SHORT_RATIO_THRESHOLD}x раз\n\n"
+        f"  - Мелкие: ${MIN_LIQUIDATION_VOLUME['small']:,}\n\n"
         f"🎯 <b>Адаптивные цели:</b>\n"
         f"• TP: от {MIN_TP}% до {MAX_TP}%\n"
         f"• SL: от {MIN_SL}% до {MAX_SL}%\n\n"
-        f"💡 Long/Short данные кешируются на {LONG_SHORT_CACHE_TIME} секунд"
+        f"📍 Биржа: Binance"
     )
     for chat_id in list(users.keys()):
         if users[chat_id]['active']:
