@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 
 # ========== НАСТРОЙКИ СКРИНЕРА ==========
 PUMP_THRESHOLD = 2.0               # Памп от 2% за 5 минут
-LIQUIDATION_THRESHOLD = 50000      # Минимальная сумма ликвидации $50k
+LIQUIDATION_THRESHOLD = 1000      # Минимальная сумма ликвидации $50k
 
 # ========== НАСТРОЙКИ LONG/SHORT RATIO ==========
 USE_LONG_SHORT_RATIO = True        # Включить Long/Short фильтр
