@@ -7,7 +7,7 @@ from datetime import datetime
 # Настройки
 TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
 TELEGRAM_CHAT_ID = '5296533274'
-LIQUIDATION_THRESHOLD = 5000 # Минимальная сумма ликвидации в USD
+LIQUIDATION_THRESHOLD = 10000 # Минимальная сумма ликвидации в USD
 TEST_MODE = False
 
 # Топ-25 монет по рыночной капитализации
