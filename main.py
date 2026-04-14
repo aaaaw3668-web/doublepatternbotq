@@ -1,11 +1,11 @@
-rom websocket import WebSocketApp
+from websocket import WebSocketApp
 import json
 import time
 import requests
 from datetime import datetime
 
 # Настройки
-TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
+TELEGRAM_BOT_TOKEN = '8514584009:AAFmnFff-9avc9mm-B9ZpR0AQcosUIaDb9g'
 TELEGRAM_CHAT_ID = '5296533274'
 LIQUIDATION_THRESHOLD = 50000  # Минимальная сумма ликвидации в USD
 TEST_MODE = False
