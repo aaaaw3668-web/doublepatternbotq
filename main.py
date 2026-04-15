@@ -7,11 +7,11 @@ import atexit
 
 # Настройки
 TELEGRAM_BOT_TOKEN = '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I'
-OI_THRESHOLD = 5
-PRICE_INCREASE_THRESHOLD = 3  # Порог для роста цены
-PRICE_DECREASE_THRESHOLD = -5
+OI_THRESHOLD = 2.5
+PRICE_INCREASE_THRESHOLD = 10  # Порог для роста цены
+PRICE_DECREASE_THRESHOLD = -10
 
- # Порог для падения цены
+# Порог для падения цены
 TIME_WINDOW = 60 * 5
 MAX_ALERTS_PER_DAY = 3
 
@@ -33,9 +33,11 @@ historical_data = {}
 def generate_links(symbol):
     """Генерация ссылок на аналитические ресурсы"""
     clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+    # Исправленная ссылка Coinglass TV (как в памп боте)
+    coinglass_symbol = f"Binance_{symbol}"
     return {
-        'coinglass': f"https://www.coinglass.com/pro/futures/LiquidationHeatMapModel3?coin={clean_symbol}&type=pair",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}",
+        'coinglass': f"https://www.coinglass.com/tv/{coinglass_symbol}",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{symbol}",
         'dextools': f"https://www.dextools.io/app/en/ether/pair-explorer/{clean_symbol}",
         'binance': f"https://www.binance.com/ru/trade/{symbol}",
         'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
@@ -67,14 +69,24 @@ def send_telegram_notification(chat_id, message, symbol):
         print(f"Лимит уведомлений достигнут для {symbol} у пользователя {chat_id}")
         return False
 
-    # Используем моноширинный шрифт для символа
+    # Используем моноширинный шрифт для ВСЕХ чисел и важных значений
+    import re
+    
+    # Моноширинный символ
     monospace_symbol = f"<code>{symbol}</code>"
-
+    
+    # Оборачиваем все числа в сообщении в моноширинный шрифт
+    def wrap_numbers(text):
+        # Находим все числа (целые и десятичные, с минусом и без)
+        return re.sub(r'(-?\d+(?:\.\d+)?%)', r'<code>\1</code>', text)
+    
+    message = wrap_numbers(message)
+    
     links = generate_links(symbol)
     message_with_links = (
         f"{message}\n\n"
         f"🔗 <b>Быстрый анализ:</b>\n"
-        f"• 📊 <a href='{links['coinglass']}'>Coinglass</a>\n"
+        f"• 📊 <a href='{links['coinglass']}'>Coinglass TV</a>\n"
         f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
         f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
         f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
@@ -88,7 +100,8 @@ def send_telegram_notification(chat_id, message, symbol):
         'chat_id': chat_id,
         'text': message_with_links,
         'parse_mode': 'HTML',
-        'disable_web_page_preview': False
+        'disable_web_page_preview': False,
+        'link_preview_options': {'is_disabled': False}
     }
     try:
         response = requests.post(url, json=payload)
@@ -149,7 +162,7 @@ def add_user(chat_id):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': chat_id,
-            'text': "✅ Вы успешно подписались на уведомления о торговых сигналах!",
+            'text': "✅ Вы успешно подписались на уведомления о торговых сигналах!\n\n📊 <b>Формат сообщений:</b>\n• Все <code>числа</code> и <code>проценты</code> можно скопировать одним нажатием\n• <code>Название монеты</code> также копируется",
             'parse_mode': 'HTML'
         }
         try:
@@ -236,7 +249,7 @@ def handle_telegram_updates():
                         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Команды бота:</b>\n/start - подписаться на уведомления\n/stop - отписаться от уведомлений\n/help - показать эту справку",
+                            'text': "🤖 <b>Команды бота:</b>\n\n/start - подписаться на уведомления\n/stop - отписаться от уведомлений\n/help - показать эту справку\n\n📊 <b>Формат:</b>\n• Все <code>числа</code> и <code>проценты</code> выделены моноширинным шрифтом\n• Нажмите на любое <code>число</code> или <code>название монеты</code> чтобы скопировать",
                             'parse_mode': 'HTML'
                         }
                         try:
@@ -269,7 +282,7 @@ def main():
         historical_data[symbol] = {'oi': [], 'price': []}
 
     # Уведомление о запуске всем пользователям
-    broadcast_message("🔍 <b>Бот начал работу!</b>\n\nМониторинг рынка активирован с аналитическими ссылками!")
+    broadcast_message("🔍 <b>Бот начал работу!</b>\n\nМониторинг рынка активирован с аналитическими ссылками!\n\n📊 <b>Формат:</b> Все <code>числа</code> и <code>проценты</code> можно скопировать одним нажатием")
     print("Бот успешно запущен и отправил уведомление")
 
     while True:
@@ -297,14 +310,14 @@ def main():
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
                                 alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                msg = (f"📈 <b>{symbol}</b>\n"
-                                       f"Рост OI: +{oi_change:.4f}%\n"
-                                       f"Было: {old_oi:.4f}\n"
-                                       f"Стало: {current_oi:.4f}\n"
-                                       f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
+                                msg = (f"📈 <b>{symbol}</b>\n\n"
+                                       f"📊 <b>Рост OI:</b> <code>+{oi_change:.2f}%</code>\n\n"
+                                       f"📌 <b>Было:</b> <code>{old_oi:.0f}</code>\n"
+                                       f"📌 <b>Стало:</b> <code>{current_oi:.0f}</code>\n\n"
+                                       f"⚠️ <b>Уведомлений сегодня:</b> <code>{alert_count}/{MAX_ALERTS_PER_DAY}</code>")
                                 send_telegram_notification(chat_id, msg, symbol)
 
-                # Проверка цены
+                # Обновляем данные цены
                 historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
                 historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price']
                                                     if timestamp - x['timestamp'] <= TIME_WINDOW]
@@ -313,35 +326,34 @@ def main():
                     old_price = historical_data[symbol]['price'][0]['value']
                     price_change = calculate_change(old_price, current_price)
 
-                    # Сигнал на рост цены (как было)
+                    # Сигнал на рост цены
                     if price_change >= PRICE_INCREASE_THRESHOLD:
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
                                 alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                msg = (f"🚨 <b>{symbol}</b>\n"
-                                       f"📈 Рост цены: +{price_change:.2f}%\n"
-                                       f"Было: {old_price:.4f}\n"
-                                       f"Стало: {current_price:.4f}\n"
-                                       f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
+                                msg = (f"🚨 <b>{symbol}</b>\n\n"
+                                       f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n\n"
+                                       f"📌 <b>Было:</b> <code>{old_price:.4f}</code>\n"
+                                       f"📌 <b>Стало:</b> <code>{current_price:.4f}</code>\n\n"
+                                       f"⚠️ <b>Уведомлений сегодня:</b> <code>{alert_count}/{MAX_ALERTS_PER_DAY}</code>")
                                 send_telegram_notification(chat_id, msg, symbol)
 
-                    # НОВОЕ: Сигнал на падение цены (от -5%)
+                    # Сигнал на падение цены
                     elif price_change <= PRICE_DECREASE_THRESHOLD:
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
                                 alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                msg = (f"🔻 <b>{symbol}</b>\n"
-                                       f"📉 Падение цены: {price_change:.2f}%\n"
-                                       f"Было: {old_price:.2f}\n"
-                                       f"Стало: {current_price:.2f}\n"
-                                       f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
+                                msg = (f"🔻 <b>{symbol}</b>\n\n"
+                                       f"📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>\n\n"
+                                       f"📌 <b>Было:</b> <code>{old_price:.2f}</code>\n"
+                                       f"📌 <b>Стало:</b> <code>{current_price:.2f}</code>\n\n"
+                                       f"⚠️ <b>Уведомлений сегодня:</b> <code>{alert_count}/{MAX_ALERTS_PER_DAY}</code>")
                                 send_telegram_notification(chat_id, msg, symbol)
 
             time.sleep(5)
 
         except KeyboardInterrupt:
             print("\nОстановка бота...")
-            # Сообщение о выключении отправится автоматически через atexit
             break
         except Exception as e:
             print(f"Критическая ошибка: {repr(e)}")
