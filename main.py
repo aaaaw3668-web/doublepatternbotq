@@ -1,9 +1,10 @@
 import requests
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import urllib.parse
 import threading
 import atexit
+import pytz
 
 # Настройки
 TELEGRAM_BOT_TOKEN = '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I'
@@ -13,62 +14,72 @@ PRICE_DECREASE_THRESHOLD = -10
 
 # Порог для падения цены
 TIME_WINDOW = 60 * 5
-MAX_ALERTS_PER_DAY = 10
 
 # База данных пользователей (в памяти)
 users = {
     '5296533274': {  # Пример пользователя
         'active': True,
         'daily_alerts': {
-            'date': date.today(),
+            'date': None,  # Будет установлен при первом обновлении
             'counts': {}
         }
     }
 }
 
+# Устанавливаем часовой пояс Уфы (Екатеринбург UTC+5)
+UFA_TZ = pytz.timezone('Asia/Yekaterinburg')
+
 # Глобальные структуры данных
 historical_data = {}
 
 
-def generate_links(symbol):
-    """Генерация ссылок на аналитические ресурсы"""
-    clean_symbol = symbol.replace('USDT', '').replace('1000', '')
-    # Исправленная ссылка Coinglass TV (как в памп боте)
-    coinglass_symbol = f"Binance_{symbol}"
-    return {
-        'coinglass': f"https://www.coinglass.com/tv/{coinglass_symbol}",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{symbol}",
-        'dextools': f"https://www.dextools.io/app/en/ether/pair-explorer/{clean_symbol}",
-        'binance': f"https://www.binance.com/ru/trade/{symbol}",
-        'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
-    }
+def get_ufa_date():
+    """Возвращает текущую дату по времени Уфы"""
+    return datetime.now(UFA_TZ).date()
 
 
 def reset_daily_counters(chat_id):
-    today = date.today()
-    if users[chat_id]['daily_alerts']['date'] != today:
-        users[chat_id]['daily_alerts']['date'] = today
-        users[chat_id]['daily_alerts']['counts'] = {}
-        print(f"Счетчики уведомлений сброшены для пользователя {chat_id}")
+    """Сбрасывает счётчики уведомлений, если наступил новый день по Уфе"""
+    today_ufa = get_ufa_date()
+    user_data = users[chat_id]['daily_alerts']
+    
+    if user_data['date'] != today_ufa:
+        user_data['date'] = today_ufa
+        user_data['counts'] = {}
+        print(f"Счетчики уведомлений сброшены для пользователя {chat_id} (новая дата: {today_ufa})")
+        return True
+    return False
+
+
+def get_alert_count(chat_id, symbol):
+    """Возвращает количество уведомлений за сегодня по символу"""
+    reset_daily_counters(chat_id)
+    return users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
+
+
+def increment_alert_count(chat_id, symbol):
+    """Увеличивает счётчик уведомлений для символа"""
+    reset_daily_counters(chat_id)
+    users[chat_id]['daily_alerts']['counts'][symbol] = get_alert_count(chat_id, symbol) + 1
 
 
 def can_send_alert(chat_id, symbol):
+    """Проверяет, можно ли отправить уведомление (без лимита, только проверка активности)"""
     if chat_id not in users or not users[chat_id]['active']:
         return False
-
-    reset_daily_counters(chat_id)
-    count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-    if count >= MAX_ALERTS_PER_DAY:
-        return False
-    users[chat_id]['daily_alerts']['counts'][symbol] = count + 1
     return True
 
 
 def send_telegram_notification(chat_id, message, symbol):
+    """Отправляет уведомление, увеличивая счётчик"""
     if not can_send_alert(chat_id, symbol):
-        print(f"Лимит уведомлений достигнут для {symbol} у пользователя {chat_id}")
+        print(f"Пользователь {chat_id} не активен")
         return False
 
+    # Увеличиваем счётчик уведомлений
+    increment_alert_count(chat_id, symbol)
+    current_count = get_alert_count(chat_id, symbol)
+    
     # Используем моноширинный шрифт для ВСЕХ чисел и важных значений
     import re
     
@@ -89,7 +100,8 @@ def send_telegram_notification(chat_id, message, symbol):
         f"• 📊 <a href='{links['coinglass']}'>Coinglass TV</a>\n"
         f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
         f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
-        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
+        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>\n\n"
+        f"📊 <b>Уведомлений за сегодня:</b> <code>{current_count}</code>"
     )
 
     # Заменяем обычное название символа на моноширинное
@@ -146,13 +158,27 @@ def fetch_bybit_ticker(symbol):
     return None
 
 
+def generate_links(symbol):
+    """Генерация ссылок на аналитические ресурсы"""
+    clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+    # Исправленная ссылка Coinglass TV (как в памп боте)
+    coinglass_symbol = f"Binance_{symbol}"
+    return {
+        'coinglass': f"https://www.coinglass.com/tv/{coinglass_symbol}",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{symbol}",
+        'dextools': f"https://www.dextools.io/app/en/ether/pair-explorer/{clean_symbol}",
+        'binance': f"https://www.binance.com/ru/trade/{symbol}",
+        'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
+    }
+
+
 def add_user(chat_id):
     """Добавление нового пользователя"""
     if chat_id not in users:
         users[chat_id] = {
             'active': True,
             'daily_alerts': {
-                'date': date.today(),
+                'date': get_ufa_date(),  # Устанавливаем текущую дату по Уфе
                 'counts': {}
             }
         }
@@ -162,7 +188,7 @@ def add_user(chat_id):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': chat_id,
-            'text': "✅ Вы успешно подписались на уведомления о торговых сигналах!\n\n📊 <b>Формат сообщений:</b>\n• Все <code>числа</code> и <code>проценты</code> можно скопировать одним нажатием\n• <code>Название монеты</code> также копируется",
+            'text': "✅ Вы успешно подписались на уведомления о торговых сигналах!\n\n📊 <b>Формат сообщений:</b>\n• Все <code>числа</code> и <code>проценты</code> можно скопировать одним нажатием\n• <code>Название монеты</code> также копируется\n• Счётчик уведомлений сбрасывается каждый день в <b>00:00 по Уфе</b>",
             'parse_mode': 'HTML'
         }
         try:
@@ -244,12 +270,34 @@ def handle_telegram_updates():
                             requests.post(url, json=payload)
                         except Exception as e:
                             print(f"Ошибка отправки сообщения: {e}")
+                    elif text == '/stats':
+                        # Отправляем статистику по уведомлениям
+                        reset_daily_counters(chat_id)
+                        counts = users[chat_id]['daily_alerts']['counts']
+                        if counts:
+                            stats_text = "📊 <b>Статистика уведомлений за сегодня:</b>\n\n"
+                            for sym, count in counts.items():
+                                stats_text += f"• <code>{sym}</code>: {count}\n"
+                            stats_text += f"\n🕐 <i>Сбросится в 00:00 по Уфе</i>"
+                        else:
+                            stats_text = "📊 Сегодня уведомлений не было"
+                        
+                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        payload = {
+                            'chat_id': chat_id,
+                            'text': stats_text,
+                            'parse_mode': 'HTML'
+                        }
+                        try:
+                            requests.post(url, json=payload)
+                        except Exception as e:
+                            print(f"Ошибка отправки статистики: {e}")
                     elif text == '/help':
                         # Отправляем справку
                         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': "🤖 <b>Команды бота:</b>\n\n/start - подписаться на уведомления\n/stop - отписаться от уведомлений\n/help - показать эту справку\n\n📊 <b>Формат:</b>\n• Все <code>числа</code> и <code>проценты</code> выделены моноширинным шрифтом\n• Нажмите на любое <code>число</code> или <code>название монеты</code> чтобы скопировать",
+                            'text': "🤖 <b>Команды бота:</b>\n\n/start - подписаться на уведомления\n/stop - отписаться от уведомлений\n/stats - показать статистику уведомлений за сегодня\n/help - показать эту справку\n\n📊 <b>Особенности:</b>\n• Все <code>числа</code> и <code>проценты</code> выделены моноширинным шрифтом\n• Счётчик уведомлений сбрасывается каждый день в <b>00:00 по Уфе</b>\n• Нет ограничений на количество уведомлений",
                             'parse_mode': 'HTML'
                         }
                         try:
@@ -263,8 +311,43 @@ def handle_telegram_updates():
             time.sleep(5)
 
 
+def daily_reset_checker():
+    """Фоновый поток для проверки сброса счётчиков в 00:00 по Уфе"""
+    while True:
+        try:
+            now_ufa = datetime.now(UFA_TZ)
+            # Вычисляем время до следующего полуночи
+            midnight_ufa = datetime(now_ufa.year, now_ufa.month, now_ufa.day, 0, 0, 0) + timedelta(days=1)
+            seconds_until_midnight = (midnight_ufa - now_ufa).total_seconds()
+            
+            # Ждём до полуночи
+            time.sleep(seconds_until_midnight)
+            
+            # Сбрасываем счётчики для всех пользователей
+            current_date = get_ufa_date()
+            for chat_id in list(users.keys()):
+                users[chat_id]['daily_alerts']['date'] = current_date
+                users[chat_id]['daily_alerts']['counts'] = {}
+                print(f"Автоматический сброс счётчиков для {chat_id} в {current_date}")
+            
+            # Отправляем уведомление о сбросе
+            broadcast_message(f"🔄 <b>Счётчики уведомлений обновлены</b>\n\nНовый день по Уфе: <code>{current_date}</code>\nВсе счётчики сброшены до 0")
+            
+        except Exception as e:
+            print(f"Ошибка в daily_reset_checker: {e}")
+            time.sleep(60)
+
+
 def main():
     print("Запуск мониторинга...")
+    print(f"Часовой пояс: Уфа (UTC+5)")
+    print(f"Текущая дата по Уфе: {get_ufa_date()}")
+    
+    # Инициализируем даты для существующих пользователей
+    current_date = get_ufa_date()
+    for chat_id in users:
+        if users[chat_id]['daily_alerts']['date'] is None:
+            users[chat_id]['daily_alerts']['date'] = current_date
 
     # Регистрируем функцию для отправки сообщения при выключении
     atexit.register(send_shutdown_message)
@@ -272,6 +355,10 @@ def main():
     # Запускаем обработчик сообщений в отдельном потоке
     update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     update_thread.start()
+    
+    # Запускаем поток для ежедневного сброса счётчиков
+    reset_thread = threading.Thread(target=daily_reset_checker, daemon=True)
+    reset_thread.start()
 
     symbols = fetch_perpetual_symbols()
     if not symbols:
@@ -282,8 +369,8 @@ def main():
         historical_data[symbol] = {'oi': [], 'price': []}
 
     # Уведомление о запуске всем пользователям
-    broadcast_message("🔍 <b>Бот начал работу!</b>\n\nМониторинг рынка активирован с аналитическими ссылками!\n\n📊 <b>Формат:</b> Все <code>числа</code> и <code>проценты</code> можно скопировать одним нажатием")
-    print("Бот успешно запущен и отправил уведомление")
+    broadcast_message(f"🔍 <b>Бот начал работу!</b>\n\nМониторинг рынка активирован с аналитическими ссылками!\n\n📊 <b>Особенности:</b>\n• Все <code>числа</code> и <code>проценты</code> можно скопировать\n• Счётчик уведомлений сбрасывается в <b>00:00 по Уфе</b>\n• <b>Нет ограничений</b> на количество уведомлений\n• Команда /stats показывает статистику за сегодня")
+    print("Бот успешно запущен")
 
     while True:
         try:
@@ -309,12 +396,11 @@ def main():
                     if oi_change >= OI_THRESHOLD:
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
-                                alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
+                                alert_count = get_alert_count(chat_id, symbol)
                                 msg = (f"📈 <b>{symbol}</b>\n\n"
                                        f"📊 <b>Рост OI:</b> <code>+{oi_change:.2f}%</code>\n\n"
                                        f"📌 <b>Было:</b> <code>{old_oi:.0f}</code>\n"
-                                       f"📌 <b>Стало:</b> <code>{current_oi:.0f}</code>\n\n"
-                                       f"⚠️ <b>Уведомлений сегодня:</b> <code>{alert_count}/{MAX_ALERTS_PER_DAY}</code>")
+                                       f"📌 <b>Стало:</b> <code>{current_oi:.0f}</code>")
                                 send_telegram_notification(chat_id, msg, symbol)
 
                 # Обновляем данные цены
@@ -330,24 +416,20 @@ def main():
                     if price_change >= PRICE_INCREASE_THRESHOLD:
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
-                                alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
                                 msg = (f"🚨 <b>{symbol}</b>\n\n"
                                        f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n\n"
                                        f"📌 <b>Было:</b> <code>{old_price:.4f}</code>\n"
-                                       f"📌 <b>Стало:</b> <code>{current_price:.4f}</code>\n\n"
-                                       f"⚠️ <b>Уведомлений сегодня:</b> <code>{alert_count}/{MAX_ALERTS_PER_DAY}</code>")
+                                       f"📌 <b>Стало:</b> <code>{current_price:.4f}</code>")
                                 send_telegram_notification(chat_id, msg, symbol)
 
                     # Сигнал на падение цены
                     elif price_change <= PRICE_DECREASE_THRESHOLD:
                         for chat_id in list(users.keys()):
                             if users[chat_id]['active']:
-                                alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
                                 msg = (f"🔻 <b>{symbol}</b>\n\n"
                                        f"📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>\n\n"
                                        f"📌 <b>Было:</b> <code>{old_price:.2f}</code>\n"
-                                       f"📌 <b>Стало:</b> <code>{current_price:.2f}</code>\n\n"
-                                       f"⚠️ <b>Уведомлений сегодня:</b> <code>{alert_count}/{MAX_ALERTS_PER_DAY}</code>")
+                                       f"📌 <b>Стало:</b> <code>{current_price:.2f}</code>")
                                 send_telegram_notification(chat_id, msg, symbol)
 
             time.sleep(5)
