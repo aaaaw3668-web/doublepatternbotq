@@ -9,7 +9,7 @@ import atexit
 TELEGRAM_BOT_TOKEN = '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I'
 OI_THRESHOLD = 10
 PRICE_INCREASE_THRESHOLD = 1.5 # Порог для роста цены
-PRICE_DECREASE_THRESHOLD = -1.5  # Порог для падения цены
+PRICE_DECREASE_THRESHOLD = -30  # Порог для падения цены
 TIME_WINDOW = 60 * 5
 
 # База данных пользователей (в памяти)
