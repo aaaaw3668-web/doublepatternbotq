@@ -18,10 +18,10 @@ def send_message(chat_id, text):
     except:
         pass
 
-def format_message(exchange, symbol, change, old_price, new_price):
-    """Форматирование сообщения с моноширинным шрифтом (только рост)"""
+def format_message(symbol, change, old_price, new_price):
+    """Форматирование сообщения с моноширинным шрифтом (без названия биржи)"""
     # Оборачиваем символ в моноширинный
-    monospace_symbol = f"<code>{exchange} {symbol}</code>"
+    monospace_symbol = f"<code>{symbol}</code>"
     
     # Оборачиваем процент
     percent_text = f"<code>+{change:.2f}%</code>"
@@ -105,7 +105,6 @@ def handle_telegram():
                             users[chat_id] = True
                             welcome_msg = (
                                 f"✅ <b>Подписка оформлена!</b>\n\n"
-                                f"📍 Binance + Bybit\n"
                                 f"📊 Отслеживается {len(price_history)} пар\n"
                                 f"🎯 Порог роста: <code>+{PRICE_UP_THRESHOLD}%</code> за <code>{TIME_WINDOW // 60}</code> минут\n\n"
                                 f"💡 <b>Совет:</b> Все <code>числа</code> и <code>названия</code> можно скопировать одним нажатием"
@@ -172,8 +171,8 @@ def main():
                     change = ((price - old_price) / old_price) * 100
                     
                     if change >= PRICE_UP_THRESHOLD:
-                        print(f"📈 Binance {symbol}: +{change:.2f}% | {price:.8f}")
-                        msg = format_message("Binance", symbol, change, old_price, price)
+                        print(f"📈 {symbol}: +{change:.2f}% | {price:.8f}")
+                        msg = format_message(symbol, change, old_price, price)
                         for chat_id in users:
                             send_message(chat_id, msg)
                         time.sleep(0.5)
@@ -197,8 +196,8 @@ def main():
                     change = ((price - old_price) / old_price) * 100
                     
                     if change >= PRICE_UP_THRESHOLD:
-                        print(f"📈 Bybit {symbol}: +{change:.2f}% | {price:.8f}")
-                        msg = format_message("Bybit", symbol, change, old_price, price)
+                        print(f"📈 {symbol}: +{change:.2f}% | {price:.8f}")
+                        msg = format_message(symbol, change, old_price, price)
                         for chat_id in users:
                             send_message(chat_id, msg)
                         time.sleep(0.5)
