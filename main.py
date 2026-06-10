@@ -2,10 +2,9 @@ import os
 import requests
 import time
 import threading
-import re
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-PRICE_DOWN_THRESHOLD = -2.0  # Порог роста 2%
+PRICE_DOWN_THRESHOLD = -2.0  # Порог падения -2%
 TIME_WINDOW = 300  # 5 минут
 
 users = {}
@@ -19,12 +18,12 @@ def send_message(chat_id, text):
         pass
 
 def format_message(symbol, change, old_price, new_price):
-    """Форматирование сообщения с моноширинным шрифтом (без названия биржи)"""
+    """Форматирование сообщения с моноширинным шрифтом (только падение)"""
     # Оборачиваем символ в моноширинный
     monospace_symbol = f"<code>{symbol}</code>"
     
     # Оборачиваем процент
-    percent_text = f"<code>+{change:.2f}%</code>"
+    percent_text = f"<code>{change:.2f}%</code>"
     
     # Оборачиваем цены
     old_price_text = f"<code>{old_price:.8f}</code>"
@@ -32,7 +31,7 @@ def format_message(symbol, change, old_price, new_price):
     
     # Формируем сообщение
     message = (
-        f"🚨 РОСТ\n"
+        f"🔻 ПАДЕНИЕ\n"
         f"{monospace_symbol}\n\n"
         f"📊 Изменение: {percent_text}\n\n"
         f"💰 Было: {old_price_text}\n"
@@ -105,8 +104,9 @@ def handle_telegram():
                             users[chat_id] = True
                             welcome_msg = (
                                 f"✅ <b>Подписка оформлена!</b>\n\n"
+                                f"📍 Binance + Bybit\n"
                                 f"📊 Отслеживается {len(price_history)} пар\n"
-                                f"🎯 Порог роста: <code>+{PRICE_UP_THRESHOLD}%</code> за <code>{TIME_WINDOW // 60}</code> минут\n\n"
+                                f"🎯 Порог падения: <code>{PRICE_DOWN_THRESHOLD}%</code> за <code>{TIME_WINDOW // 60}</code> минут\n\n"
                                 f"💡 <b>Совет:</b> Все <code>числа</code> и <code>названия</code> можно скопировать одним нажатием"
                             )
                             send_message(chat_id, welcome_msg)
@@ -144,15 +144,15 @@ def main():
     threading.Thread(target=handle_telegram, daemon=True).start()
     
     print("=" * 50)
-    print(f"✅ Бот запущен (только рост)")
+    print(f"✅ Бот запущен (только падение)")
     print(f"📍 Binance: {len(binance_symbols)} монет")
     print(f"📍 Bybit: {len(bybit_symbols)} монет")
-    print(f"🎯 Порог роста: +{PRICE_UP_THRESHOLD}% за {TIME_WINDOW // 60} минут")
+    print(f"🎯 Порог падения: {PRICE_DOWN_THRESHOLD}% за {TIME_WINDOW // 60} минут")
     print("=" * 50)
     
     while True:
         try:
-            # Проверяем Binance монеты (только рост)
+            # Проверяем Binance монеты (только падение)
             for symbol in binance_symbols:
                 key = f"Binance_{symbol}"
                 price = get_binance_price(symbol)
@@ -165,19 +165,19 @@ def main():
                 price_history[key].append({'price': price, 'time': now})
                 price_history[key] = [p for p in price_history[key] if now - p['time'] <= TIME_WINDOW]
                 
-                # Проверяем рост
+                # Проверяем падение
                 if len(price_history[key]) > 1 and users:
                     old_price = price_history[key][0]['price']
                     change = ((price - old_price) / old_price) * 100
                     
-                     if change <= PRICE_DOWN_THRESHOLD:
-                        print(f"📈 {symbol}: +{change:.2f}% | {price:.8f}")
+                    if change <= PRICE_DOWN_THRESHOLD:
+                        print(f"📉 Binance {symbol}: {change:.2f}% | {price:.8f}")
                         msg = format_message(symbol, change, old_price, price)
                         for chat_id in users:
                             send_message(chat_id, msg)
                         time.sleep(0.5)
             
-            # Проверяем Bybit монеты (только рост)
+            # Проверяем Bybit монеты (только падение)
             for symbol in bybit_symbols:
                 key = f"Bybit_{symbol}"
                 price = get_bybit_price(symbol)
@@ -190,13 +190,13 @@ def main():
                 price_history[key].append({'price': price, 'time': now})
                 price_history[key] = [p for p in price_history[key] if now - p['time'] <= TIME_WINDOW]
                 
-                # Проверяем рост
+                # Проверяем падение
                 if len(price_history[key]) > 1 and users:
                     old_price = price_history[key][0]['price']
                     change = ((price - old_price) / old_price) * 100
                     
-                    if change >= PRICE_UP_THRESHOLD:
-                        print(f"📈 {symbol}: +{change:.2f}% | {price:.8f}")
+                    if change <= PRICE_DOWN_THRESHOLD:
+                        print(f"📉 Bybit {symbol}: {change:.2f}% | {price:.8f}")
                         msg = format_message(symbol, change, old_price, price)
                         for chat_id in users:
                             send_message(chat_id, msg)
