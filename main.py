@@ -5,7 +5,7 @@ import threading
 import re
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-PRICE_UP_THRESHOLD = 2.0  # Порог роста 2%
+PRICE_DOWN_THRESHOLD = -2.0  # Порог роста 2%
 TIME_WINDOW = 300  # 5 минут
 
 users = {}
@@ -170,7 +170,7 @@ def main():
                     old_price = price_history[key][0]['price']
                     change = ((price - old_price) / old_price) * 100
                     
-                    if change >= PRICE_UP_THRESHOLD:
+                     if change <= PRICE_DOWN_THRESHOLD:
                         print(f"📈 {symbol}: +{change:.2f}% | {price:.8f}")
                         msg = format_message(symbol, change, old_price, price)
                         for chat_id in users:
