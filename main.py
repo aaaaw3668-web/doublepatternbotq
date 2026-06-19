@@ -6,7 +6,11 @@ import threading
 import atexit
 
 # Настройки
-TELEGRAM_BOT_TOKEN = '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I'
+# Настройки
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+if not TELEGRAM_BOT_TOKEN:
+    print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
+    exit(1)
 OI_THRESHOLD = 5
 PRICE_INCREASE_THRESHOLD = 31 # Порог для роста цены
 PRICE_DECREASE_THRESHOLD = -31  # Порог для падения цены
