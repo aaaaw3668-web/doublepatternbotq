@@ -1,215 +1,438 @@
-import os
 import requests
 import time
+from datetime import datetime, timedelta
+import urllib.parse
 import threading
+import atexit
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-PRICE_DOWN_THRESHOLD = -2.0  # Порог падения -2%
-TIME_WINDOW = 300  # 5 минут
+# Настройки
+TELEGRAM_BOT_TOKEN = '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I'
+OI_THRESHOLD = 5
+PRICE_INCREASE_THRESHOLD = 31 # Порог для роста цены
+PRICE_DECREASE_THRESHOLD = -31  # Порог для падения цены
+TIME_WINDOW = 60 * 5
 
-users = {}
-price_history = {}  # {exchange_symbol: [{'price': price, 'time': timestamp}]}
+# База данных пользователей (в памяти)
+users = {
+    '5296533274': {  # Пример пользователя
+        'active': True,
+        'alert_counts': {}  # Простой счетчик без сброса
+    }
+}
 
-def send_message(chat_id, text):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'})
-    except:
-        pass
+# Глобальные структуры данных
+historical_data = {}
 
-def format_message(symbol, change, old_price, new_price):
-    """Форматирование сообщения с моноширинным шрифтом (только падение)"""
-    # Оборачиваем символ в моноширинный
+
+def get_alert_count(chat_id, symbol):
+    """Возвращает количество уведомлений по символу за всё время"""
+    return users[chat_id]['alert_counts'].get(symbol, 0)
+
+
+def increment_alert_count(chat_id, symbol):
+    """Увеличивает счётчик уведомлений для символа"""
+    users[chat_id]['alert_counts'][symbol] = get_alert_count(chat_id, symbol) + 1
+
+
+def can_send_alert(chat_id, symbol):
+    """Проверяет, можно ли отправить уведомление"""
+    if chat_id not in users or not users[chat_id]['active']:
+        return False
+    return True
+
+
+def send_telegram_notification(chat_id, message, symbol):
+    """Отправляет уведомление, увеличивая счётчик"""
+    if not can_send_alert(chat_id, symbol):
+        print(f"Пользователь {chat_id} не активен")
+        return False
+
+    # Увеличиваем счётчик уведомлений
+    increment_alert_count(chat_id, symbol)
+    current_count = get_alert_count(chat_id, symbol)
+    
+    import re
+    
+    # Моноширинный символ
     monospace_symbol = f"<code>{symbol}</code>"
     
-    # Оборачиваем процент
-    percent_text = f"<code>{change:.2f}%</code>"
+    # Оборачиваем все числа в сообщении в моноширинный шрифт
+    def wrap_numbers(text):
+        return re.sub(r'(-?\d+(?:\.\d+)?%)', r'<code>\1</code>', text)
+        return re.sub(r'(-?\d+(?:\.\d+)?)', r'<code>\1</code>', text)
     
-    # Оборачиваем цены
-    old_price_text = f"<code>{old_price:.8f}</code>"
-    new_price_text = f"<code>{new_price:.8f}</code>"
+    message = wrap_numbers(message)
     
-    # Формируем сообщение
-    message = (
-        f"🔻 ПАДЕНИЕ\n"
-        f"{monospace_symbol}\n\n"
-        f"📊 Изменение: {percent_text}\n\n"
-        f"💰 Было: {old_price_text}\n"
-        f"💰 Стало: {new_price_text}"
+    links = generate_links(symbol)
+    message_with_links = (
+        f"{message}\n\n"
+        f"🔗 <b>Быстрый анализ:</b>\n"
+        f"• 📊 <a href='{links['coinglass']}'>Coinglass TV</a>\n"
+        f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
+        f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
+        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>\n\n"
+        f"📊 <b>Всего уведомлений по {monospace_symbol}:</b> <code>{current_count}</code>"
     )
+
+    # Заменяем обычное название символа на моноширинное
+    message_with_links = message_with_links.replace(symbol, monospace_symbol)
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message_with_links,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': False
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        print(f"✓ Уведомление отправлено для {symbol} пользователю {chat_id} (всего: {current_count})")
+        return True
+    except Exception as e:
+        print(f"✗ Ошибка отправки пользователю {chat_id}: {repr(e)}")
+        return False
+
+
+def calculate_change(old, new):
+    if old == 0:
+        return 0.0
+    return ((new - old) / old) * 100
+
+
+def fetch_perpetual_symbols():
+    """Получение списка всех перпетуальных контрактов"""
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    params = {"category": "linear"}
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data['retCode'] == 0:
+                symbols = [item['symbol'] for item in data['result']['list']]
+                print(f"✓ Загружено {len(symbols)} символов")
+                return symbols
+    except Exception as e:
+        print(f"✗ Ошибка получения символов: {e}")
+    return []
+
+
+def fetch_bybit_ticker(symbol):
+    """Получение данных по тикеру"""
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear", "symbol": symbol}
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data['retCode'] == 0 and data['result']['list']:
+                return data['result']['list'][0]
+    except Exception as e:
+        print(f"✗ Ошибка получения данных {symbol}: {e}")
+    return None
+
+
+def generate_links(symbol):
+    """Генерация ссылок на аналитические ресурсы с URL-кодированием"""
+    from urllib.parse import quote
     
-    return message
+    # Кодируем символы для URL
+    encoded_symbol = quote(symbol)
+    clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+    encoded_clean_symbol = quote(clean_symbol)
+    
+    return {
+        'coinglass': f"https://www.coinglass.com/tv/Binance_{encoded_symbol}",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{encoded_symbol}",
+        'binance': f"https://www.binance.com/ru/trade/{encoded_symbol}",
+        'bybit': f"https://www.bybit.com/trade/usdt/{encoded_symbol}"
+    }
 
-def get_binance_symbols():
-    """Получение всех USDT перпетуальных контрактов с Binance"""
-    try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/price"
-        resp = requests.get(url)
-        data = resp.json()
-        symbols = [item['symbol'] for item in data if item['symbol'].endswith('USDT')]
-        print(f"✅ Binance: загружено {len(symbols)} монет")
-        return symbols
-    except Exception as e:
-        print(f"Ошибка загрузки Binance: {e}")
-        return []
 
-def get_bybit_symbols():
-    """Получение всех USDT перпетуальных контрактов с Bybit"""
-    try:
-        url = "https://api.bybit.com/v5/market/tickers?category=linear"
-        resp = requests.get(url)
-        data = resp.json()
-        symbols = [item['symbol'] for item in data['result']['list']]
-        print(f"✅ Bybit: загружено {len(symbols)} монет")
-        return symbols
-    except Exception as e:
-        print(f"Ошибка загрузки Bybit: {e}")
-        return []
+def add_user(chat_id):
+    """Добавление нового пользователя"""
+    if chat_id not in users:
+        users[chat_id] = {
+            'active': True,
+            'alert_counts': {}
+        }
+        print(f"✓ Добавлен новый пользователь: {chat_id}")
 
-def get_binance_price(symbol):
-    """Получение цены с Binance"""
-    try:
-        url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
-        resp = requests.get(url)
-        return float(resp.json()['price'])
-    except:
-        return None
+        # Отправляем приветственное сообщение
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': "✅ <b>Вы успешно подписались на уведомления!</b>\n\n"
+                   "📊 <b>Особенности:</b>\n"
+                   "• Все <code>числа</code> и <code>проценты</code> можно скопировать одним нажатием\n"
+                   "• <code>Название монеты</code> также копируется\n"
+                   "• Счётчик показывает <b>общее количество уведомлений</b> по каждой монете\n"
+                   "• <b>Нет ограничений</b> на количество уведомлений в день\n"
+                   "• Команда <code>/stats</code> - статистика по всем монетам\n"
+                   "• Команда <code>/reset_stats</code> - сбросить статистику",
+            'parse_mode': 'HTML'
+        }
+        try:
+            requests.post(url, json=payload)
+        except Exception as e:
+            print(f"✗ Ошибка отправки приветствия: {e}")
+        return True
+    return False
 
-def get_bybit_price(symbol):
-    """Получение цены с Bybit"""
-    try:
-        url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
-        resp = requests.get(url)
-        return float(resp.json()['result']['list'][0]['lastPrice'])
-    except:
-        return None
 
-def handle_telegram():
-    """Обработка команд /start и /stop"""
-    last_update = 0
+def remove_user(chat_id):
+    """Удаление пользователя"""
+    if chat_id in users:
+        del users[chat_id]
+        print(f"✓ Пользователь {chat_id} удален")
+        return True
+    return False
+
+
+def reset_user_stats(chat_id):
+    """Сброс статистики уведомлений для пользователя"""
+    if chat_id in users:
+        users[chat_id]['alert_counts'] = {}
+        print(f"✓ Статистика сброшена для пользователя {chat_id}")
+        
+        # Отправляем подтверждение
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': "✅ <b>Статистика уведомлений сброшена!</b>\n\nВсе счётчики обнулены.",
+            'parse_mode': 'HTML'
+        }
+        try:
+            requests.post(url, json=payload)
+        except Exception as e:
+            print(f"✗ Ошибка отправки подтверждения: {e}")
+        return True
+    return False
+
+
+def broadcast_message(message):
+    """Отправка сообщения всем активным пользователям"""
+    for chat_id in list(users.keys()):
+        if users[chat_id]['active']:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                'chat_id': chat_id,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            try:
+                requests.post(url, json=payload)
+            except Exception as e:
+                print(f"✗ Ошибка отправки сообщения пользователю {chat_id}: {e}")
+
+
+def send_shutdown_message():
+    """Отправка сообщения о выключении бота"""
+    shutdown_msg = "🛑 <b>Бот остановлен</b>\n\nМониторинг приостановлен. Для возобновления работы перезапустите бота."
+    broadcast_message(shutdown_msg)
+    print("✓ Сообщение о выключении отправлено всем пользователям")
+
+
+def handle_telegram_updates():
+    """Обработка входящих сообщений от пользователей"""
+    last_update_id = 0
+
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            response = requests.get(url, params={'timeout': 30, 'offset': last_update + 1})
+            params = {'timeout': 30, 'offset': last_update_id + 1}
+            response = requests.get(url, params=params)
             data = response.json()
-            
+
             if data['ok']:
                 for update in data['result']:
-                    last_update = update['update_id']
-                    if 'message' in update:
-                        chat_id = str(update['message']['chat']['id'])
-                        text = update['message'].get('text', '').lower()
+                    last_update_id = update['update_id']
+
+                    if 'message' not in update:
+                        continue
+
+                    message = update['message']
+                    chat_id = str(message['chat']['id'])
+                    text = message.get('text', '').strip().lower()
+
+                    # Обработка команд
+                    if text == '/start':
+                        add_user(chat_id)
+                    elif text == '/stop':
+                        remove_user(chat_id)
+                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        payload = {
+                            'chat_id': chat_id,
+                            'text': "❌ Вы отписались от уведомлений.",
+                            'parse_mode': 'HTML'
+                        }
+                        try:
+                            requests.post(url, json=payload)
+                        except Exception as e:
+                            print(f"✗ Ошибка отправки сообщения: {e}")
+                    elif text == '/stats':
+                        # Отправляем статистику по уведомлениям
+                        counts = users[chat_id]['alert_counts']
+                        if counts:
+                            # Сортируем по количеству уведомлений
+                            sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+                            stats_text = "📊 <b>Статистика уведомлений (всего):</b>\n\n"
+                            for sym, count in sorted_counts[:20]:  # Показываем топ-20
+                                stats_text += f"• <code>{sym}</code>: {count}\n"
+                            if len(sorted_counts) > 20:
+                                stats_text += f"\n<i>...и ещё {len(sorted_counts) - 20} монет</i>"
+                        else:
+                            stats_text = "📊 Пока не было ни одного уведомления"
                         
-                        if text == '/start':
-                            users[chat_id] = True
-                            welcome_msg = (
-                                f"✅ <b>Подписка оформлена!</b>\n\n"
-                                f"📍 Binance + Bybit\n"
-                                f"📊 Отслеживается {len(price_history)} пар\n"
-                                f"🎯 Порог падения: <code>{PRICE_DOWN_THRESHOLD}%</code> за <code>{TIME_WINDOW // 60}</code> минут\n\n"
-                                f"💡 <b>Совет:</b> Все <code>числа</code> и <code>названия</code> можно скопировать одним нажатием"
-                            )
-                            send_message(chat_id, welcome_msg)
-                            print(f"➕ Новый пользователь: {chat_id}")
-                        
-                        elif text == '/stop':
-                            users.pop(chat_id, None)
-                            send_message(chat_id, "❌ Вы отписались от уведомлений")
-                            print(f"➖ Пользователь отписался: {chat_id}")
+                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        payload = {
+                            'chat_id': chat_id,
+                            'text': stats_text,
+                            'parse_mode': 'HTML'
+                        }
+                        try:
+                            requests.post(url, json=payload)
+                        except Exception as e:
+                            print(f"✗ Ошибка отправки статистики: {e}")
+                    elif text == '/reset_stats':
+                        reset_user_stats(chat_id)
+                    elif text == '/help':
+                        # Отправляем справку
+                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        payload = {
+                            'chat_id': chat_id,
+                            'text': "🤖 <b>Команды бота:</b>\n\n"
+                                   "/start - подписаться на уведомления\n"
+                                   "/stop - отписаться от уведомлений\n"
+                                   "/stats - показать статистику уведомлений\n"
+                                   "/reset_stats - сбросить статистику\n"
+                                   "/help - показать эту справку\n\n"
+                                   "📊 <b>Особенности:</b>\n"
+                                   "• Все <code>числа</code> и <code>проценты</code> выделены моноширинным шрифтом\n"
+                                   "• <b>Нет ограничений</b> на количество уведомлений\n"
+                                   "• Счётчик показывает общее количество уведомлений за всё время",
+                            'parse_mode': 'HTML'
+                        }
+                        try:
+                            requests.post(url, json=payload)
+                        except Exception as e:
+                            print(f"✗ Ошибка отправки справки: {e}")
+
             time.sleep(1)
         except Exception as e:
-            print(f"Ошибка обработки: {e}")
+            print(f"✗ Ошибка обработки обновлений: {e}")
             time.sleep(5)
 
+
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ Ошибка: TELEGRAM_BOT_TOKEN не установлен!")
-        return
-    
-    # Получаем монеты с обеих бирж
-    binance_symbols = get_binance_symbols()
-    bybit_symbols = get_bybit_symbols()
-    
-    if not binance_symbols and not bybit_symbols:
-        print("❌ Не удалось загрузить монеты")
-        return
-    
-    # Инициализируем историю
-    for symbol in binance_symbols:
-        price_history[f"Binance_{symbol}"] = []
-    for symbol in bybit_symbols:
-        price_history[f"Bybit_{symbol}"] = []
-    
-    # Запускаем обработчик команд
-    threading.Thread(target=handle_telegram, daemon=True).start()
-    
     print("=" * 50)
-    print(f"✅ Бот запущен (только падение)")
-    print(f"📍 Binance: {len(binance_symbols)} монет")
-    print(f"📍 Bybit: {len(bybit_symbols)} монет")
-    print(f"🎯 Порог падения: {PRICE_DOWN_THRESHOLD}% за {TIME_WINDOW // 60} минут")
+    print("Запуск мониторинга...")
     print("=" * 50)
     
+    # Регистрируем функцию для отправки сообщения при выключении
+    atexit.register(send_shutdown_message)
+
+    # Запускаем обработчик сообщений в отдельном потоке
+    update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
+    update_thread.start()
+
+    # Получаем список символов
+    symbols = fetch_perpetual_symbols()
+    if not symbols:
+        print("✗ Не удалось получить список символов")
+        return
+
+    # Инициализируем исторические данные
+    for symbol in symbols:
+        historical_data[symbol] = {'oi': [], 'price': []}
+
+    # Уведомление о запуске всем пользователям
+    broadcast_message(
+        "🔍 <b>Бот начал работу!</b>\n\n"
+        "Мониторинг рынка активирован!\n\n"
+        "📊 <b>Особенности:</b>\n"
+        "• Все <code>числа</code> и <code>проценты</code> можно скопировать\n"
+        "• <b>Нет ограничений</b> на количество уведомлений\n"
+        "• Команда <code>/stats</code> - статистика\n"
+        "• Команда <code>/reset_stats</code> - сбросить статистику"
+    )
+    
+    print(f"✓ Бот успешно запущен")
+    print(f"✓ Отслеживается {len(symbols)} символов")
+    print(f"✓ Порог OI: {OI_THRESHOLD}%")
+    print(f"✓ Порог роста цены: {PRICE_INCREASE_THRESHOLD}%")
+    print(f"✓ Порог падения цены: {PRICE_DECREASE_THRESHOLD}%")
+    print(f"✓ Временное окно: {TIME_WINDOW // 60} минут")
+    print("=" * 50)
+
     while True:
         try:
-            # Проверяем Binance монеты (только падение)
-            for symbol in binance_symbols:
-                key = f"Binance_{symbol}"
-                price = get_binance_price(symbol)
-                if not price:
+            for symbol in symbols:
+                ticker_data = fetch_bybit_ticker(symbol)
+                if not ticker_data:
                     continue
-                
-                now = time.time()
-                
-                # Сохраняем историю
-                price_history[key].append({'price': price, 'time': now})
-                price_history[key] = [p for p in price_history[key] if now - p['time'] <= TIME_WINDOW]
-                
-                # Проверяем падение
-                if len(price_history[key]) > 1 and users:
-                    old_price = price_history[key][0]['price']
-                    change = ((price - old_price) / old_price) * 100
-                    
-                    if change <= PRICE_DOWN_THRESHOLD:
-                        print(f"📉 Binance {symbol}: {change:.2f}% | {price:.8f}")
-                        msg = format_message(symbol, change, old_price, price)
-                        for chat_id in users:
-                            send_message(chat_id, msg)
-                        time.sleep(0.5)
-            
-            # Проверяем Bybit монеты (только падение)
-            for symbol in bybit_symbols:
-                key = f"Bybit_{symbol}"
-                price = get_bybit_price(symbol)
-                if not price:
-                    continue
-                
-                now = time.time()
-                
-                # Сохраняем историю
-                price_history[key].append({'price': price, 'time': now})
-                price_history[key] = [p for p in price_history[key] if now - p['time'] <= TIME_WINDOW]
-                
-                # Проверяем падение
-                if len(price_history[key]) > 1 and users:
-                    old_price = price_history[key][0]['price']
-                    change = ((price - old_price) / old_price) * 100
-                    
-                    if change <= PRICE_DOWN_THRESHOLD:
-                        print(f"📉 Bybit {symbol}: {change:.2f}% | {price:.8f}")
-                        msg = format_message(symbol, change, old_price, price)
-                        for chat_id in users:
-                            send_message(chat_id, msg)
-                        time.sleep(0.5)
-            
-            time.sleep(10)
-            
+
+                current_oi = float(ticker_data['openInterest'])
+                current_price = float(ticker_data['lastPrice'])
+                timestamp = int(datetime.now().timestamp())
+
+                # Обновляем данные OI
+                historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
+                historical_data[symbol]['oi'] = [x for x in historical_data[symbol]['oi']
+                                                 if timestamp - x['timestamp'] <= TIME_WINDOW]
+
+                # Проверка роста OI
+                if len(historical_data[symbol]['oi']) > 1:
+                    old_oi = historical_data[symbol]['oi'][0]['value']
+                    oi_change = calculate_change(old_oi, current_oi)
+
+                    if oi_change >= OI_THRESHOLD:
+                        for chat_id in list(users.keys()):
+                            if users[chat_id]['active']:
+                                msg = (f"📈 <b>{symbol}</b>\n\n"
+                                       f"📊 <b>Рост OI:</b> <code>+{oi_change:.2f}%</code>\n\n"
+                                       f"📌 <b>Было:</b> <code>{old_oi:.0f}</code>\n"
+                                       f"📌 <b>Стало:</b> <code>{current_oi:.0f}</code>")
+                                send_telegram_notification(chat_id, msg, symbol)
+
+                # Обновляем данные цены
+                historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
+                historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price']
+                                                    if timestamp - x['timestamp'] <= TIME_WINDOW]
+
+                if len(historical_data[symbol]['price']) > 1:
+                    old_price = historical_data[symbol]['price'][0]['value']
+                    price_change = calculate_change(old_price, current_price)
+
+                    # Сигнал на рост цены
+                    if price_change >= PRICE_INCREASE_THRESHOLD:
+                        for chat_id in list(users.keys()):
+                            if users[chat_id]['active']:
+                                msg = (f"🚨 <b>{symbol}</b>\n\n"
+                                       f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n\n"
+                                       f"📌 <b>Было:</b> <code>{old_price:.8f}</code>\n"
+                                       f"📌 <b>Стало:</b> <code>{current_price:.8f}</code>")
+                                send_telegram_notification(chat_id, msg, symbol)
+
+                    # Сигнал на падение цены
+                    elif price_change <= PRICE_DECREASE_THRESHOLD:
+                        for chat_id in list(users.keys()):
+                            if users[chat_id]['active']:
+                                msg = (f"🔻 <b>{symbol}</b>\n\n"
+                                       f"📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>\n\n"
+                                       f"📌 <b>Было:</b> <code>{old_price:.8f}</code>\n"
+                                       f"📌 <b>Стало:</b> <code>{current_price:.8f}</code>")
+                                send_telegram_notification(chat_id, msg, symbol)
+
+            time.sleep(5)
+
         except KeyboardInterrupt:
-            print("\n❌ Бот остановлен")
+            print("\n🛑 Остановка бота...")
             break
         except Exception as e:
-            print(f"Ошибка: {e}")
+            print(f"✗ Критическая ошибка: {repr(e)}")
             time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
