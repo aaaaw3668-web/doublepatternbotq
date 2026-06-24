@@ -12,8 +12,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
-OI_THRESHOLD = 5
-PRICE_INCREASE_THRESHOLD = 31 # Порог для роста цены
+OI_THRESHOLD = 500
+PRICE_INCREASE_THRESHOLD = 2.5 # Порог для роста цены
 PRICE_DECREASE_THRESHOLD = -31  # Порог для падения цены
 TIME_WINDOW = 60 * 5
 
