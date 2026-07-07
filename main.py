@@ -9,7 +9,7 @@ import re
 from zoneinfo import ZoneInfo
 from flask import Flask  # <-- НОВОЕ: импорт Flask
 
-# НОВОЕ: Создаем Flask приложени
+# НОВОЕ: Создаем Flask приложни
 app = Flask(__name__)
 PORT = int(os.environ.get('PORT', 10000))
 
