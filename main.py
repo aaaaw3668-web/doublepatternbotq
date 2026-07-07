@@ -1,11 +1,17 @@
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import urllib.parse
 import threading
 import atexit
 import os
 import re
+from zoneinfo import ZoneInfo
+from flask import Flask  # <-- НОВОЕ: импорт Flask
+
+# НОВОЕ: Создаем Flask приложение
+app = Flask(__name__)
+PORT = int(os.environ.get('PORT', 10000))
 
 # Настройки
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -17,7 +23,7 @@ OI_THRESHOLD = 500
 PRICE_INCREASE_THRESHOLD = 2.5     # Порог для роста цены
 PRICE_DECREASE_THRESHOLD = -31     # Порог для падения цены
 TIME_WINDOW = 60 * 5
-DAILY_ALERT_LIMIT = 10              # Лимит уведомлений на одну монету в день
+DAILY_ALERT_LIMIT = 5              # Лимит уведомлений на одну монету в день
 
 # База данных пользователей (в памяти)
 users = {
@@ -30,11 +36,25 @@ users = {
 # Глобальные структуры данных
 historical_data = {}
 
+# НОВОЕ: Простой эндпоинт для keep-alive
+@app.route('/')
+def health_check():
+    return "Bot is running!", 200
+
+@app.route('/ping')
+def ping():
+    return "pong", 200
 
 def get_ye_time():
     """Возвращает текущее время по Уфимскому времени (UTC+5)"""
-    # Смещение Уфы — UTC+5. datetime.utcnow() + 5 часов
-    return datetime.utcnow() + timedelta(hours=5)
+    # Используем timezone-aware объекты с явным указанием UTC
+    return datetime.now(timezone.utc) + timedelta(hours=5)
+
+
+def get_ye_time_zoneinfo():
+    """Альтернативный вариант с явным указанием часового пояса Уфы"""
+    # Уфа находится в часовом поясе Asia/Yekaterinburg (UTC+5)
+    return datetime.now(ZoneInfo("Asia/Yekaterinburg"))
 
 
 def get_alert_count(chat_id, symbol):
@@ -375,7 +395,7 @@ def main():
 
                 current_oi = float(ticker_data['openInterest'])
                 current_price = float(ticker_data['lastPrice'])
-                timestamp = int(datetime.now().timestamp())
+                timestamp = int(datetime.now(timezone.utc).timestamp())
 
                 # Обновляем данные OI
                 historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
@@ -432,5 +452,13 @@ def main():
             time.sleep(10)
 
 
+# НОВОЕ: Измененная точка входа
 if __name__ == "__main__":
-    main()
+    # Запускаем основную логику бота в отдельном потоке
+    bot_thread = threading.Thread(target=main, daemon=True)
+    bot_thread.start()
+    
+    # Запускаем Flask сервер (основной поток)
+    # Flask будет слушать порт и отвечать на ping-запросы Render
+    print(f"🚀 Запуск веб-сервера на порту {PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
