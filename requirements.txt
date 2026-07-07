@@ -2,3 +2,4 @@ requests>=2.25.0
 websocket-client==1.6.4
 python-dotenv 
 pytz==2024.1
+Flask==2.3.2
