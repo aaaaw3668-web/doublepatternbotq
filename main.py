@@ -3,43 +3,43 @@ import time
 from datetime import datetime, timedelta
 import urllib.parse
 import threading
+import atexit
 import os
 import re
-from flask import Flask  # Добавили Flask для обхода спящего режима Render
 
-# Инициализация веб-сервера
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running 24/7!", 200
-
-def run_flask():
-    # Render автоматически передает порт в переменную окружения PORT
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-# Настройки бота
+# Настройки
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
 OI_THRESHOLD = 500
-PRICE_INCREASE_THRESHOLD = 2.5
-PRICE_DECREASE_THRESHOLD = -31
+PRICE_INCREASE_THRESHOLD = 2.5     # Порог для роста цены
+PRICE_DECREASE_THRESHOLD = -31     # Порог для падения цены
 TIME_WINDOW = 60 * 5
-DAILY_ALERT_LIMIT = 10
+DAILY_ALERT_LIMIT = 10              # Лимит уведомлений на одну монету в день
 
+# Сессия для переиспользования соединений (важно для хостинга)
 session = requests.Session()
-users = {'5296533274': {'active': True, 'alert_counts': {}}}
+
+# База данных пользователей (в памяти)
+users = {
+    '5296533274': {  # Пример пользователя
+        'active': True,
+        'alert_counts': {}  # Структура: { 'BTCUSDT': количество_за_день }
+    }
+}
+
+# Глобальные структуры данных
 historical_data = {}
 
 def get_ye_time():
+    """Возвращает текущее время по Уфимскому времени (UTC+5)"""
     return datetime.utcnow() + timedelta(hours=5)
 
 def get_alert_count(chat_id, symbol):
-    if chat_id not in users: return 0
+    if chat_id not in users:
+        return 0
     return users[chat_id]['alert_counts'].get(symbol, 0)
 
 def increment_alert_count(chat_id, symbol):
@@ -47,14 +47,19 @@ def increment_alert_count(chat_id, symbol):
         users[chat_id]['alert_counts'][symbol] = get_alert_count(chat_id, symbol) + 1
 
 def can_send_alert(chat_id, symbol):
-    if chat_id not in users or not users[chat_id]['active']: return False
-    if get_alert_count(chat_id, symbol) >= DAILY_ALERT_LIMIT: return False
+    if chat_id not in users or not users[chat_id]['active']:
+        return False
+    if get_alert_count(chat_id, symbol) >= DAILY_ALERT_LIMIT:
+        return False
     return True
 
 def send_telegram_notification(chat_id, message, symbol):
-    if not can_send_alert(chat_id, symbol): return False
+    if not can_send_alert(chat_id, symbol):
+        return False
+
     increment_alert_count(chat_id, symbol)
     current_count = get_alert_count(chat_id, symbol)
+    
     monospace_symbol = f"<code>{symbol}</code>"
     
     def wrap_numbers(text):
@@ -66,19 +71,28 @@ def send_telegram_notification(chat_id, message, symbol):
         f"{message}\n\n"
         f"🔗 <b>Быстрый анализ:</b>\n"
         f"• 📊 <a href='{links['coinglass']}'>Coinglass TV</a>\n"
-        f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n\n"
+        f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
+        f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
+        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>\n\n"
         f"📊 <b>Уведомлений по {monospace_symbol} за сегодня:</b> <code>{current_count}/{DAILY_ALERT_LIMIT}</code>"
     )
+
     message_with_links = message_with_links.replace(symbol, monospace_symbol)
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': chat_id, 'text': message_with_links, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
+    payload = {
+        'chat_id': chat_id,
+        'text': message_with_links,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': False
+    }
     try:
         response = session.post(url, json=payload, timeout=10)
         response.raise_for_status()
+        print(f"✓ Уведомление отправлено для {symbol} пользователю {chat_id} ({current_count}/{DAILY_ALERT_LIMIT})")
         return True
     except Exception as e:
-        print(f"✗ Ошибка отправки: {repr(e)}")
+        print(f"✗ Ошибка отправки пользователю {chat_id}: {repr(e)}")
         return False
 
 def check_and_reset_at_midnight():
@@ -86,73 +100,137 @@ def check_and_reset_at_midnight():
     while True:
         try:
             time.sleep(5)
-            current_date = get_ye_time().date()
+            current_ye_time = get_ye_time()
+            current_date = current_ye_time.date()
+            
             if current_date > last_reset_date:
+                print(f"⏰ Наступила полночь по Уфимскому времени ({current_ye_time}). Сброс лимитов...")
                 for chat_id in users:
                     users[chat_id]['alert_counts'] = {}
+                
+                reset_message = (
+                    "🔄 <b>Внимание! Наступила полночь по Уфимскому времени (00:00).</b>\n"
+                    f"Суточные лимиты уведомлений (<code>{DAILY_ALERT_LIMIT}</code> на монету) успешно сброшены!"
+                )
+                broadcast_message(reset_message)
                 last_reset_date = current_date
         except Exception as e:
-            print(f"✗ Ошибка сброса лимитов: {e}")
+            print(f"✗ Ошибка в потоке сброса лимитов: {e}")
             time.sleep(10)
 
 def calculate_change(old, new):
-    if old == 0: return 0.0
+    if old == 0:
+        return 0.0
     return ((new - old) / old) * 100
 
 def fetch_perpetual_symbols():
     url = "https://api.bybit.com/v5/market/instruments-info"
+    params = {"category": "linear"}
     try:
-        response = session.get(url, params={"category": "linear"}, timeout=15)
+        response = session.get(url, params=params, timeout=15)
         if response.status_code == 200:
             data = response.json()
             if data['retCode'] == 0:
-                return [item['symbol'] for item in data['result']['list'] if item['symbol'].endswith('USDT')]
+                symbols = [item['symbol'] for item in data['result']['list'] if item['symbol'].endswith('USDT')]
+                print(f"✓ Загружено {len(symbols)} USDT-символов")
+                return symbols
     except Exception as e:
-        print(f"✗ Ошибка символов: {e}")
+        print(f"✗ Ошибка получения символов: {e}")
     return []
 
 def fetch_all_bybit_tickers():
+    """ОПТИМИЗАЦИЯ: Получает все тикеры одним запросом вместо сотен отдельных"""
     url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear"}
     try:
-        response = session.get(url, params={"category": "linear"}, timeout=15)
-        if response.status_code == 200 and response.json()['retCode'] == 0:
-            return response.json()['result']['list']
+        response = session.get(url, params=params, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            if data['retCode'] == 0:
+                return data['result']['list']
     except Exception as e:
-        print(f"✗ Ошибка тикеров: {e}")
+        print(f"✗ Ошибка получения тикеров Bybit: {e}")
     return []
 
 def generate_links(symbol):
     encoded_symbol = urllib.parse.quote(symbol)
     return {
         'coinglass': f"https://www.coinglass.com/tv/Binance_{encoded_symbol}",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{encoded_symbol}"
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{encoded_symbol}",
+        'binance': f"https://www.binance.com/ru/trade/{encoded_symbol}",
+        'bybit': f"https://www.bybit.com/trade/usdt/{encoded_symbol}"
     }
+
+def broadcast_message(message):
+    for chat_id in list(users.keys()):
+        if users[chat_id]['active']:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'}
+            try: session.post(url, json=payload, timeout=10)
+            except Exception as e: print(f"✗ Ошибка рассылки: {e}")
 
 def handle_telegram_updates():
     last_update_id = 0
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            response = session.get(url, params={'timeout': 20, 'offset': last_update_id + 1}, timeout=25)
+            params = {'timeout': 20, 'offset': last_update_id + 1}
+            response = session.get(url, params=params, timeout=25)
             data = response.json()
+
             if data.get('ok'):
                 for update in data['result']:
                     last_update_id = update['update_id']
                     if 'message' not in update: continue
-                    chat_id = str(update['message']['chat']['id'])
-                    text = update['message'].get('text', '').strip().lower()
+
+                    message = update['message']
+                    chat_id = str(message['chat']['id'])
+                    text = message.get('text', '').strip().lower()
 
                     if chat_id not in users and text == '/start':
                         users[chat_id] = {'active': True, 'alert_counts': {}}
+                        welcome_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        payload = {
+                            'chat_id': chat_id,
+                            'text': f"✅ <b>Вы успешно подписались!</b>\nЛимит: <b>{DAILY_ALERT_LIMIT} в сутки</b>.",
+                            'parse_mode': 'HTML'
+                        }
+                        try: session.post(welcome_url, json=payload)
+                        except: pass
+                    
+                    elif text == '/stats':
+                        counts = users.get(chat_id, {}).get('alert_counts', {})
+                        stats_text = f"📊 <b>Статистика (Лимит: {DAILY_ALERT_LIMIT}):</b>\n\n"
+                        if counts:
+                            for sym, count in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:20]:
+                                stats_text += f"• <code>{sym}</code>: {count}/{DAILY_ALERT_LIMIT}\n"
+                        else:
+                            stats_text += "Сегодня алертов не было."
+                        
+                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        try: session.post(url, json={'chat_id': chat_id, 'text': stats_text, 'parse_mode': 'HTML'})
+                        except: pass
             time.sleep(1)
         except Exception as e:
+            print(f"✗ Ошибка Long Polling Telegram: {e}")
             time.sleep(5)
 
-def main_loop():
+def main():
+    print("=== Запуск оптимизированного мониторинга ===")
+    
+    # Запуск фоновых потоков
+    threading.Thread(target=handle_telegram_updates, daemon=True).start()
+    threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
+
     symbols = fetch_perpetual_symbols()
-    if not symbols: return
+    if not symbols:
+        print("✗ Критическая ошибка: список символов пуст.")
+        return
+
     for symbol in symbols:
         historical_data[symbol] = {'oi': [], 'price': []}
+
+    print(f"✓ Мониторинг {len(symbols)} пар запущен.")
 
     while True:
         try:
@@ -160,45 +238,56 @@ def main_loop():
             if not tickers:
                 time.sleep(10)
                 continue
+
             timestamp = int(datetime.now().timestamp())
 
             for ticker in tickers:
                 symbol = ticker['symbol']
-                if symbol not in historical_data: continue
+                if symbol not in historical_data:
+                    continue
+
                 try:
                     current_oi = float(ticker['openInterest'])
                     current_price = float(ticker['lastPrice'])
-                except (ValueError, KeyError): continue
+                except (ValueError, KeyError):
+                    continue
 
-                # Проверка OI
+                # Анализ OI
                 historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
                 historical_data[symbol]['oi'] = [x for x in historical_data[symbol]['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+
                 if len(historical_data[symbol]['oi']) > 1:
-                    oi_change = calculate_change(historical_data[symbol]['oi'][0]['value'], current_oi)
+                    old_oi = historical_data[symbol]['oi'][0]['value']
+                    oi_change = calculate_change(old_oi, current_oi)
+
                     if oi_change >= OI_THRESHOLD:
                         for chat_id in list(users.keys()):
-                            send_telegram_notification(chat_id, f"📈 <b>{symbol}</b>\n📊 <b>Рост OI:</b> <code>+{oi_change:.2f}%</code>", symbol)
+                            msg = f"📈 <b>{symbol}</b>\n\n📊 <b>Рост OI:</b> <code>+{oi_change:.2f}%</code>"
+                            send_telegram_notification(chat_id, msg, symbol)
 
-                # Проверка Цены
+                # Анализ цены
                 historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
                 historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+
                 if len(historical_data[symbol]['price']) > 1:
-                    price_change = calculate_change(historical_data[symbol]['price'][0]['value'], current_price)
+                    old_price = historical_data[symbol]['price'][0]['value']
+                    price_change = calculate_change(old_price, current_price)
+
                     if price_change >= PRICE_INCREASE_THRESHOLD:
                         for chat_id in list(users.keys()):
-                            send_telegram_notification(chat_id, f"🚨 <b>{symbol}</b>\n📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>", symbol)
+                            msg = f"🚨 <b>{symbol}</b>\n\n📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>"
+                            send_telegram_notification(chat_id, msg, symbol)
                     elif price_change <= PRICE_DECREASE_THRESHOLD:
                         for chat_id in list(users.keys()):
-                            send_telegram_notification(chat_id, f"🔻 <b>{symbol}</b>\n📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>", symbol)
-            time.sleep(15)
+                            msg = f"🔻 <b>{symbol}</b>\n\n📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>"
+                            send_telegram_notification(chat_id, msg, symbol)
+
+            # Пауза между циклами опроса всего рынка (10-15 секунд оптимально для бесплатного хостинга)
+            time.sleep(12)
+
         except Exception as e:
+            print(f"✗ Ошибка основного цикла: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
-    # 1. Запуск Flask в отдельном потоке (для Render)
-    threading.Thread(target=run_flask, daemon=True).start()
-    # 2. Запуск потоков бота
-    threading.Thread(target=handle_telegram_updates, daemon=True).start()
-    threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
-    # 3. Основной цикл
-    main_loop()
+    main()
