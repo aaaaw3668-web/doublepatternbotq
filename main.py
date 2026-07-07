@@ -1,9 +1,8 @@
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import urllib.parse
 import threading
-import atexit
 import os
 import re
 
@@ -35,7 +34,7 @@ historical_data = {}
 
 def get_ye_time():
     """Возвращает текущее время по Уфимскому времени (UTC+5)"""
-    return datetime.utcnow() + timedelta(hours=5)
+    return datetime.now(timezone.utc) + timedelta(hours=5)
 
 def get_alert_count(chat_id, symbol):
     if chat_id not in users:
@@ -99,7 +98,7 @@ def check_and_reset_at_midnight():
     last_reset_date = get_ye_time().date()
     while True:
         try:
-            time.sleep(5)
+            time.sleep(30) # Достаточно проверять раз в 30 секунд вместо 5
             current_ye_time = get_ye_time()
             current_date = current_ye_time.date()
             
@@ -116,7 +115,7 @@ def check_and_reset_at_midnight():
                 last_reset_date = current_date
         except Exception as e:
             print(f"✗ Ошибка в потоке сброса лимитов: {e}")
-            time.sleep(10)
+            time.sleep(30)
 
 def calculate_change(old, new):
     if old == 0:
@@ -139,7 +138,6 @@ def fetch_perpetual_symbols():
     return []
 
 def fetch_all_bybit_tickers():
-    """ОПТИМИЗАЦИЯ: Получает все тикеры одним запросом вместо сотен отдельных"""
     url = "https://api.bybit.com/v5/market/tickers"
     params = {"category": "linear"}
     try:
@@ -197,7 +195,7 @@ def handle_telegram_updates():
                         }
                         try: session.post(welcome_url, json=payload)
                         except: pass
-                    
+                        
                     elif text == '/stats':
                         counts = users.get(chat_id, {}).get('alert_counts', {})
                         stats_text = f"📊 <b>Статистика (Лимит: {DAILY_ALERT_LIMIT}):</b>\n\n"
@@ -210,15 +208,14 @@ def handle_telegram_updates():
                         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         try: session.post(url, json={'chat_id': chat_id, 'text': stats_text, 'parse_mode': 'HTML'})
                         except: pass
-            time.sleep(1)
+            time.sleep(3) # Реже опрашиваем ТГ, если нет новых сообщений (экономия CPU)
         except Exception as e:
             print(f"✗ Ошибка Long Polling Telegram: {e}")
-            time.sleep(5)
+            time.sleep(10)
 
 def main():
     print("=== Запуск оптимизированного мониторинга ===")
     
-    # Запуск фоновых потоков
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
 
@@ -236,7 +233,7 @@ def main():
         try:
             tickers = fetch_all_bybit_tickers()
             if not tickers:
-                time.sleep(10)
+                time.sleep(15)
                 continue
 
             timestamp = int(datetime.now().timestamp())
@@ -252,9 +249,14 @@ def main():
                 except (ValueError, KeyError):
                     continue
 
+                # Микропауза внутри цикла обработки тикеров (ГЛАВНАЯ ЭКОНОМИЯ CPU)
+                time.sleep(0.01)
+
                 # Анализ OI
                 historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
-                historical_data[symbol]['oi'] = [x for x in historical_data[symbol]['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+                # Очищаем историю только если она раздувается, а не каждый раз
+                if len(historical_data[symbol]['oi']) > 30:
+                    historical_data[symbol]['oi'] = [x for x in historical_data[symbol]['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
                 if len(historical_data[symbol]['oi']) > 1:
                     old_oi = historical_data[symbol]['oi'][0]['value']
@@ -267,14 +269,15 @@ def main():
 
                 # Анализ цены
                 historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
-                historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+                if len(historical_data[symbol]['price']) > 30:
+                    historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
                 if len(historical_data[symbol]['price']) > 1:
                     old_price = historical_data[symbol]['price'][0]['value']
                     price_change = calculate_change(old_price, current_price)
 
                     if price_change >= PRICE_INCREASE_THRESHOLD:
-                        for chat_id in list(users.keys()):
+                        for chat_id in list(current_users := users.keys()):
                             msg = f"🚨 <b>{symbol}</b>\n\n📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>"
                             send_telegram_notification(chat_id, msg, symbol)
                     elif price_change <= PRICE_DECREASE_THRESHOLD:
@@ -282,12 +285,12 @@ def main():
                             msg = f"🔻 <b>{symbol}</b>\n\n📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>"
                             send_telegram_notification(chat_id, msg, symbol)
 
-            # Пауза между циклами опроса всего рынка (10-15 секунд оптимально для бесплатного хостинга)
-            time.sleep(12)
+            # Пауза между полными циклами опроса биржи (увеличена до 15 секунд)
+            time.sleep(15)
 
         except Exception as e:
             print(f"✗ Ошибка основного цикла: {e}")
-            time.sleep(10)
+            time.sleep(15)
 
 if __name__ == "__main__":
     main()
