@@ -16,7 +16,7 @@ OI_THRESHOLD = 500
 PRICE_INCREASE_THRESHOLD = 2.5     # Порог для роста цены
 PRICE_DECREASE_THRESHOLD = -31     # Порог для падения цены
 TIME_WINDOW = 60 * 5
-DAILY_ALERT_LIMIT = 10              # Лимит уведомлений на одну монету в день
+DAILY_ALERT_LIMIT = 100              # Лимит уведомлений на одну монету в день
 
 # Сессия для переиспользования соединений (важно для хостинга)
 session = requests.Session()
