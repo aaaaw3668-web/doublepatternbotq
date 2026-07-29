@@ -12,7 +12,7 @@ if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-OI_THRESHOLD = 3
+OI_THRESHOLD = 10
 PRICE_INCREASE_THRESHOLD = 30     # Порог для роста цены
 PRICE_DECREASE_THRESHOLD = -30     # Порог для падения цены
 TIME_WINDOW = 60 * 5
