@@ -13,7 +13,7 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 OI_THRESHOLD = 500
-PRICE_INCREASE_THRESHOLD = 2.5   #Порог для роста цены
+PRICE_INCREASE_THRESHOLD = 2.5     # Порог для роста цены
 PRICE_DECREASE_THRESHOLD = -30     # Порог для падения цены
 TIME_WINDOW = 60 * 5
 DAILY_ALERT_LIMIT = 100              # Лимит уведомлений на одну монету в день
@@ -95,24 +95,42 @@ def send_telegram_notification(chat_id, message, symbol):
         return False
 
 def check_and_reset_at_midnight():
-    last_reset_date = get_ye_time().date()
+    """Сброс лимитов в 5 утра по Уфимскому времени"""
+    # Вычисляем время следующего сброса (сегодня в 5:00 или завтра в 5:00)
+    now = get_ye_time()
+    reset_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
+    
+    # Если текущее время уже после 5:00, то сброс будет завтра в 5:00
+    if now >= reset_time:
+        reset_time = reset_time + timedelta(days=1)
+    
+    print(f"⏰ Следующий сброс лимитов в: {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (Уфимское время)")
+    
     while True:
         try:
-            time.sleep(30) # Достаточно проверять раз в 30 секунд вместо 5
-            current_ye_time = get_ye_time()
-            current_date = current_ye_time.date()
+            now = get_ye_time()
             
-            if current_date > last_reset_date:
-                print(f"⏰ Наступила полночь по Уфимскому времени ({current_ye_time}). Сброс лимитов...")
+            # Проверяем, наступило ли время сброса
+            if now >= reset_time:
+                print(f"⏰ Наступило 5 утра по Уфимскому времени ({now}). Сброс лимитов...")
+                
+                # Сбрасываем лимиты для всех пользователей
                 for chat_id in users:
                     users[chat_id]['alert_counts'] = {}
                 
                 reset_message = (
-                    "🔄 <b>Внимание! Наступила полночь по Уфимскому времени (00:00).</b>\n"
+                    "🔄 <b>Внимание! Наступило 5:00 по Уфимскому времени.</b>\n"
                     f"Суточные лимиты уведомлений (<code>{DAILY_ALERT_LIMIT}</code> на монету) успешно сброшены!"
                 )
                 broadcast_message(reset_message)
-                last_reset_date = current_date
+                
+                # Планируем следующий сброс на завтра в 5:00
+                reset_time = reset_time + timedelta(days=1)
+                print(f"⏰ Следующий сброс лимитов в: {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (Уфимское время)")
+            
+            # Спим до следующей проверки (каждые 30 секунд)
+            time.sleep(30)
+            
         except Exception as e:
             print(f"✗ Ошибка в потоке сброса лимитов: {e}")
             time.sleep(30)
@@ -190,7 +208,7 @@ def handle_telegram_updates():
                         welcome_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': f"✅ <b>Вы успешно подписались!</b>\nЛимит: <b>{DAILY_ALERT_LIMIT} в сутки</b>.",
+                            'text': f"✅ <b>Вы успешно подписались!</b>\nЛимит: <b>{DAILY_ALERT_LIMIT} в сутки</b>.\n⏰ Сброс лимитов в 5:00 по Уфимскому времени.",
                             'parse_mode': 'HTML'
                         }
                         try: session.post(welcome_url, json=payload)
@@ -208,7 +226,7 @@ def handle_telegram_updates():
                         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         try: session.post(url, json={'chat_id': chat_id, 'text': stats_text, 'parse_mode': 'HTML'})
                         except: pass
-            time.sleep(3) # Реже опрашиваем ТГ, если нет новых сообщений (экономия CPU)
+            time.sleep(3)
         except Exception as e:
             print(f"✗ Ошибка Long Polling Telegram: {e}")
             time.sleep(10)
@@ -277,7 +295,7 @@ def main():
                     price_change = calculate_change(old_price, current_price)
 
                     if price_change >= PRICE_INCREASE_THRESHOLD:
-                        for chat_id in list(current_users := users.keys()):
+                        for chat_id in list(users.keys()):
                             msg = f"🚨 <b>{symbol}</b>\n\n📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>"
                             send_telegram_notification(chat_id, msg, symbol)
                     elif price_change <= PRICE_DECREASE_THRESHOLD:
