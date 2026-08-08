@@ -14,7 +14,7 @@ if not TELEGRAM_BOT_TOKEN:
 
 # Пороги (в процентах)
 PRICE_INCREASE_THRESHOLD = 2.5    # рост цены >= 2.5%
-OI_DECREASE_THRESHOLD   = -5.0   # падение OI <= -5%
+OI_DECREASE_THRESHOLD   = -2.5   # падение OI <= -5%
 TIME_WINDOW = 60 * 5              # 5 минут
 DAILY_ALERT_LIMIT = 10
 
