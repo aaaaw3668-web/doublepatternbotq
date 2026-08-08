@@ -6,34 +6,30 @@ import threading
 import os
 import re
 
-# Настройки
+# ------------------- НАСТРОЙКИ -------------------
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 if not TELEGRAM_BOT_TOKEN:
-    print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
+    print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден!")
     exit(1)
 
-OI_THRESHOLD = 500
-PRICE_INCREASE_THRESHOLD = 2.5    # Порог для роста цены
-PRICE_DECREASE_THRESHOLD = -30     # Порог для падения цены
-TIME_WINDOW = 60 * 5
-DAILY_ALERT_LIMIT = 10             # Лимит уведомлений на одну монету в день
+# Пороги (в процентах)
+PRICE_INCREASE_THRESHOLD = 2.5    # рост цены >= 2.5%
+OI_DECREASE_THRESHOLD   = -5.0   # падение OI <= -5%
+TIME_WINDOW = 60 * 5              # 5 минут
+DAILY_ALERT_LIMIT = 10
 
-# Сессия для переиспользования соединений (важно для хостинга)
+# ------------------- ГЛОБАЛЬНЫЕ ДАННЫЕ -------------------
 session = requests.Session()
-
-# База данных пользователей (в памяти)
 users = {
-    '5296533274': {  # Пример пользователя
+    '5296533274': {
         'active': True,
-        'alert_counts': {}  # Структура: { 'BTCUSDT': количество_за_день }
+        'alert_counts': {}
     }
 }
-
-# Глобальные структуры данных
 historical_data = {}
 
+# ------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -------------------
 def get_ye_time():
-    """Возвращает текущее время по Уфимскому времени (UTC+5)"""
     return datetime.now(timezone.utc) + timedelta(hours=5)
 
 def get_alert_count(chat_id, symbol):
@@ -60,11 +56,10 @@ def send_telegram_notification(chat_id, message, symbol):
     current_count = get_alert_count(chat_id, symbol)
     
     monospace_symbol = f"<code>{symbol}</code>"
-    
     def wrap_numbers(text):
         return re.sub(r'(-?\d+(?:\.\d+)?%)', r'<code>\1</code>', text)
-    
     message = wrap_numbers(message)
+    
     links = generate_links(symbol)
     message_with_links = (
         f"{message}\n\n"
@@ -75,7 +70,6 @@ def send_telegram_notification(chat_id, message, symbol):
         f"• ⚡ <a href='{links['bybit']}'>Bybit</a>\n\n"
         f"📊 <b>Уведомлений по {monospace_symbol} за сегодня:</b> <code>{current_count}/{DAILY_ALERT_LIMIT}</code>"
     )
-
     message_with_links = message_with_links.replace(symbol, monospace_symbol)
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -95,42 +89,27 @@ def send_telegram_notification(chat_id, message, symbol):
         return False
 
 def check_and_reset_at_midnight():
-    """Сброс лимитов в 5 утра по Уфимскому времени"""
-    # Вычисляем время следующего сброса (сегодня в 5:00 или завтра в 5:00)
     now = get_ye_time()
     reset_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
-    
-    # Если текущее время уже после 5:00, то сброс будет завтра в 5:00
     if now >= reset_time:
         reset_time = reset_time + timedelta(days=1)
-    
     print(f"⏰ Следующий сброс лимитов в: {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (Уфимское время)")
     
     while True:
         try:
             now = get_ye_time()
-            
-            # Проверяем, наступило ли время сброса
             if now >= reset_time:
                 print(f"⏰ Наступило 5 утра по Уфимскому времени ({now}). Сброс лимитов...")
-                
-                # Сбрасываем лимиты для всех пользователей
                 for chat_id in users:
                     users[chat_id]['alert_counts'] = {}
-                
                 reset_message = (
                     "🔄 <b>Внимание! Наступило 5:00 по Уфимскому времени.</b>\n"
                     f"Суточные лимиты уведомлений (<code>{DAILY_ALERT_LIMIT}</code> на монету) успешно сброшены!"
                 )
                 broadcast_message(reset_message)
-                
-                # Планируем следующий сброс на завтра в 5:00
                 reset_time = reset_time + timedelta(days=1)
                 print(f"⏰ Следующий сброс лимитов в: {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (Уфимское время)")
-            
-            # Спим до следующей проверки (каждые 30 секунд)
             time.sleep(30)
-            
         except Exception as e:
             print(f"✗ Ошибка в потоке сброса лимитов: {e}")
             time.sleep(30)
@@ -231,8 +210,9 @@ def handle_telegram_updates():
             print(f"✗ Ошибка Long Polling Telegram: {e}")
             time.sleep(10)
 
+# ------------------- ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА -------------------
 def main():
-    print("=== Запуск оптимизированного мониторинга ===")
+    print("=== Запуск мониторинга (памп цены + падение OI) ===")
     
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -267,43 +247,38 @@ def main():
                 except (ValueError, KeyError):
                     continue
 
-                # Микропауза внутри цикла обработки тикеров (ГЛАВНАЯ ЭКОНОМИЯ CPU)
-                time.sleep(0.01)
+                time.sleep(0.01)  # микропауза для снижения нагрузки CPU
 
-                # Анализ OI
+                # --- Обновление истории OI ---
                 historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
-                # Очищаем историю только если она раздувается, а не каждый раз
                 if len(historical_data[symbol]['oi']) > 30:
                     historical_data[symbol]['oi'] = [x for x in historical_data[symbol]['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                if len(historical_data[symbol]['oi']) > 1:
-                    old_oi = historical_data[symbol]['oi'][0]['value']
-                    oi_change = calculate_change(old_oi, current_oi)
-
-                    if oi_change >= OI_THRESHOLD:
-                        for chat_id in list(users.keys()):
-                            msg = f"📈 <b>{symbol}</b>\n\n📊 <b>Рост OI:</b> <code>+{oi_change:.2f}%</code>"
-                            send_telegram_notification(chat_id, msg, symbol)
-
-                # Анализ цены
+                # --- Обновление истории цены ---
                 historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
                 if len(historical_data[symbol]['price']) > 30:
                     historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                if len(historical_data[symbol]['price']) > 1:
+                # --- Вычисление изменений (если есть данные за окно) ---
+                if len(historical_data[symbol]['oi']) > 1 and len(historical_data[symbol]['price']) > 1:
+                    old_oi = historical_data[symbol]['oi'][0]['value']
                     old_price = historical_data[symbol]['price'][0]['value']
+
+                    oi_change = calculate_change(old_oi, current_oi)
                     price_change = calculate_change(old_price, current_price)
 
-                    if price_change >= PRICE_INCREASE_THRESHOLD:
+                    # ✅ КЛЮЧЕВОЕ УСЛОВИЕ: цена растёт, OI падает
+                    if price_change >= PRICE_INCREASE_THRESHOLD and oi_change <= OI_DECREASE_THRESHOLD:
+                        msg = (
+                            f"🚀 <b>{symbol}</b> – ПАМП ПРИ ПАДЕНИИ OI\n\n"
+                            f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n"
+                            f"📉 <b>Падение OI:</b> <code>{oi_change:.2f}%</code>\n"
+                            f"⏱️ За последние {TIME_WINDOW//60} минут"
+                        )
                         for chat_id in list(users.keys()):
-                            msg = f"🚨 <b>{symbol}</b>\n\n📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>"
-                            send_telegram_notification(chat_id, msg, symbol)
-                    elif price_change <= PRICE_DECREASE_THRESHOLD:
-                        for chat_id in list(users.keys()):
-                            msg = f"🔻 <b>{symbol}</b>\n\n📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>"
                             send_telegram_notification(chat_id, msg, symbol)
 
-            # Пауза между полными циклами опроса биржи (увеличена до 15 секунд)
+            # Пауза между циклами опроса биржи
             time.sleep(15)
 
         except Exception as e:
