@@ -13,10 +13,11 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # Пороги срабатывания
-PRICE_INCREASE_THRESHOLD = 5.0   # Рост цены от +5%
-OI_DROP_THRESHOLD = -3.0          # Падение OI от -3% (и ниже, например -4%, -5%)
+PRICE_INCREASE_THRESHOLD = 2.5   # Рост цены от +5%
+OI_DROP_THRESHOLD = -3.0          # Падение OI от -3%
 
 TIME_WINDOW = 60 * 5              # Окно анализа: 5 минут
+COOLDOWN_MINUTES = 10             # Пауза (кулдаун) между алертами по одной и той же монете
 DAILY_ALERT_LIMIT = 100           # Лимит уведомлений на одну монету в день
 
 # Сессия для переиспользования соединений
@@ -32,6 +33,7 @@ users = {
 
 # Глобальные структуры данных
 historical_data = {}
+last_alert_time = {}              # { 'BTCUSDT': timestamp_последней_отправки }
 
 def get_ye_time():
     """Возвращает текущее время по Уфимскому времени (UTC+5)"""
@@ -225,7 +227,7 @@ def handle_telegram_updates():
             time.sleep(10)
 
 def main():
-    print("=== Запуск мониторинга (Рост цены + Падение OI) ===")
+    print("=== Запуск мониторинга (Рост цены + Падение OI с кулдауном) ===")
     
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -272,7 +274,7 @@ def main():
                 if len(historical_data[symbol]['price']) > 30:
                     historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                # Проверяем наличие достаточного количества данных для обоих показателей
+                # Проверяем наличие достаточного количества данных
                 if len(historical_data[symbol]['oi']) > 1 and len(historical_data[symbol]['price']) > 1:
                     old_oi = historical_data[symbol]['oi'][0]['value']
                     old_price = historical_data[symbol]['price'][0]['value']
@@ -282,14 +284,20 @@ def main():
 
                     # Одновременное условие: Цена >= +5% И OI <= -3%
                     if price_change >= PRICE_INCREASE_THRESHOLD and oi_change <= OI_DROP_THRESHOLD:
-                        msg = (
-                            f"⚡ <b>{symbol}</b>: Сквиз / Закрытие шортов\n\n"
-                            f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n"
-                            f"🔻 <b>Падение OI:</b> <code>{oi_change:.2f}%</code>\n"
-                            f"⏱ <b>Интервал:</b> последние 5 мин."
-                        )
-                        for chat_id in list(users.keys()):
-                            send_telegram_notification(chat_id, msg, symbol)
+                        # Проверяем кулдаун
+                        last_time = last_alert_time.get(symbol, 0)
+                        if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
+                            msg = (
+                                f"⚡ <b>{symbol}</b>: Сквиз / Закрытие шортов\n\n"
+                                f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n"
+                                f"🔻 <b>Падение OI:</b> <code>{oi_change:.2f}%</code>\n"
+                                f"⏱ <b>Интервал:</b> последние 5 мин."
+                            )
+                            for chat_id in list(users.keys()):
+                                send_telegram_notification(chat_id, msg, symbol)
+                            
+                            # Фиксируем время отправки алерта для кулдауна
+                            last_alert_time[symbol] = timestamp
 
             time.sleep(15)
 
